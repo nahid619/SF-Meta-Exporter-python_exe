@@ -1,0 +1,16 @@
+# Salesforce Report Exporter - Combined Requirements
+# Python 3.10+ required
+
+# ===== UI Framework =====
+customtkinter>=5.2.0
+darkdetect>=0.8.0
+
+# ===== Salesforce API =====
+requests>=2.31.0
+simple-salesforce
+
+# ===== Excel/CSV Processing =====
+openpyxl>=3.1.0
+
+# ===== System Monitoring =====
+psutil>=5.9.0
