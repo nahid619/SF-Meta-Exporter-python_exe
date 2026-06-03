@@ -75,3 +75,4 @@ COLOR_THEME     = "blue"
 DEFAULT_PICKLIST_FILENAME        = 'Picklist_Export_{timestamp}.xlsx'
 DEFAULT_METADATA_FILENAME        = 'Object_Metadata_{timestamp}.csv'
 DEFAULT_CONTENTDOCUMENT_FILENAME = 'ContentDocument_Export_{timestamp}.csv'
+DEFAULT_ATTACHMENT_FILENAME = 'Attachment_Export_{timestamp}.csv'

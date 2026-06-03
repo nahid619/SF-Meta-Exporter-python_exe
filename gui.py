@@ -11,12 +11,13 @@ from threading_helper import ThreadHelper
 import customtkinter as ctk
 
 from config import WINDOW_TITLE, APPEARANCE_MODE, COLOR_THEME, get_oauth_client_id, set_oauth_client_id
-from config import DEFAULT_PICKLIST_FILENAME, DEFAULT_METADATA_FILENAME, DEFAULT_CONTENTDOCUMENT_FILENAME
+from config import DEFAULT_PICKLIST_FILENAME, DEFAULT_METADATA_FILENAME, DEFAULT_CONTENTDOCUMENT_FILENAME, DEFAULT_ATTACHMENT_FILENAME
 from salesforce_client import SalesforceClient
 from oauth_handler import OAuthWebFlow
 from picklist_exporter import PicklistExporter
 from metadata_exporter import MetadataExporter
 from content_document_exporter import ContentDocumentExporter
+from attachment_exporter import AttachmentExporter
 from utils import format_runtime, print_picklist_statistics, print_metadata_statistics, print_content_document_statistics
 
 from soql_runner import SOQLRunner
@@ -126,6 +127,7 @@ class SalesforceExporterGUI(ctk.CTk):
         self.picklist_exporter: Optional[PicklistExporter] = None
         self.metadata_exporter: Optional[MetadataExporter] = None
         self.content_document_exporter: Optional[ContentDocumentExporter] = None
+        self.attachment_exporter: Optional[AttachmentExporter] = None
         self.all_org_objects: List[str] = []
         self.selected_objects: Set[str] = set()
         
@@ -836,6 +838,16 @@ class SalesforceExporterGUI(ctk.CTk):
             self.update_status(f"🔍 Stack trace:\n{traceback.format_exc()}")
             self.content_document_exporter = None
         
+        try:
+            self.update_status("🔧 Initializing Attachment Exporter...")
+            self.attachment_exporter = AttachmentExporter(self.sf_client)
+            self.update_status("✅ Attachment Exporter initialized")
+        except Exception as e:
+            self.update_status(f"❌ ERROR initializing Attachment Exporter: {str(e)}")
+            import traceback
+            self.update_status(f"🔍 Stack trace:\n{traceback.format_exc()}")
+            self.attachment_exporter = None
+
         # Determine connection type
         if self.custom_domain_var.get():
             connection_type = "Custom Domain"
@@ -954,6 +966,7 @@ class SalesforceExporterGUI(ctk.CTk):
         print(f"  picklist_exporter: {self.picklist_exporter is not None}")
         print(f"  metadata_exporter: {self.metadata_exporter is not None}")
         print(f"  content_document_exporter: {self.content_document_exporter is not None}")
+        print(f"  attachment_exporter: {self.attachment_exporter is not None}")
         
         if self.sf_client:
             print(f"  sf_client.sf: {self.sf_client.sf is not None}")
@@ -1028,8 +1041,8 @@ class SalesforceExporterGUI(ctk.CTk):
         export_buttons_frame.grid_columnconfigure(2, weight=1)
         export_buttons_frame.grid_columnconfigure(3, weight=1)
 
-        # Configure 6 columns with equal weight
-        for i in range(6):
+        # Configure 7 columns with equal weight
+        for i in range(7):
             export_buttons_frame.grid_columnconfigure(i, weight=1)
         
         self.export_picklist_button = ctk.CTkButton(
@@ -1091,16 +1104,27 @@ class SalesforceExporterGUI(ctk.CTk):
             hover_color="#2D7BD4",
             font=ctk.CTkFont(size=16, weight="bold")
         )
-        self.report_exporter_button.grid(row=0, column=5, sticky="ew", padx=(5, 0))
-        
+        self.report_exporter_button.grid(row=0, column=5, sticky="ew", padx=(5, 5))
+
+        self.download_attachments_button = ctk.CTkButton(
+            export_buttons_frame,
+            text="🗂 Download Attachments",
+            command=self.download_attachments_action,
+            height=50,
+            fg_color="#2D7BD4",
+            font=ctk.CTkFont(size=16, weight="bold")
+        )
+        self.download_attachments_button.grid(row=0, column=6, sticky="ew", padx=(5, 0))
+
         # Register all buttons with state manager
         self.button_manager.register_buttons({
-            'picklist': self.export_picklist_button,
-            'metadata': self.export_metadata_button,
-            'download': self.download_files_button,
-            'soql': self.run_soql_button,
-            'switch': self.salesforce_switch_button,
-            'report': self.report_exporter_button
+            'picklist':    self.export_picklist_button,
+            'metadata':    self.export_metadata_button,
+            'download':    self.download_files_button,
+            'soql':        self.run_soql_button,
+            'switch':      self.salesforce_switch_button,
+            'report':      self.report_exporter_button,
+            'attachments': self.download_attachments_button,
         })
 
 
@@ -2290,6 +2314,126 @@ class SalesforceExporterGUI(ctk.CTk):
 
 
     # ==================================
+    # Attachment Download Action Methods
+    # ==================================
+
+    def download_attachments_action(self):
+        """Handle Download Attachments button click (7th button)."""
+        if not self.sf_client or not self.attachment_exporter:
+            messagebox.showerror("Error", "Not logged in. Please log in first.")
+            return
+
+        if not self.selected_objects:
+            messagebox.showwarning(
+                "No Objects Selected",
+                "Please select at least one object from the \'Available Objects\' list\n"
+                "before downloading attachments.\n\n"
+                "The attachment download is filtered by parent object type.\n"
+                "For example, select \'Account\' to download only attachments\n"
+                "attached to Account records."
+            )
+            return
+
+        if not self.button_manager.start_operation("Attachment Download"):
+            return
+
+        selected_objects_list = sorted(list(self.selected_objects))
+
+        default_filename = DEFAULT_ATTACHMENT_FILENAME.format(
+            timestamp=datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
+        output_file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            initialfile=default_filename,
+            filetypes=[("CSV files", "*.csv")]
+        )
+
+        if not output_file_path:
+            self.button_manager.end_operation()
+            return
+
+        self.update_status(
+            f"Starting Attachment download for: {', '.join(selected_objects_list)}…"
+        )
+        start_time = time.time()
+
+        def do_export():
+            try:
+                output_path, stats = self.attachment_exporter.export_attachments(
+                    output_file_path,
+                    selected_objects=selected_objects_list,
+                    status_callback=lambda msg: self.after(
+                        0, lambda m=msg: self.update_status(m, verbose=True)
+                    ),
+                )
+                end_time          = time.time()
+                runtime_formatted = format_runtime(end_time - start_time)
+                self.after(0, lambda: self._on_download_attachments_success(
+                    output_path, stats, runtime_formatted
+                ))
+            except Exception as e:
+                self.after(0, lambda: self._on_download_attachments_error(str(e)))
+
+        ThreadHelper.run_in_thread(do_export)
+
+
+    def _on_download_attachments_success(self, output_path, stats, runtime_formatted):
+        """Called after successful attachment download."""
+        self.update_status(f"Attachment Download Complete! Runtime: {runtime_formatted}")
+
+        attachments_folder = os.path.join(os.path.dirname(output_path), "Attachments")
+
+        obj_lines = ""
+        for obj in stats.get("objects_processed", []):
+            obj_lines += (
+                f"  • {obj['object']}: "
+                f"{obj['downloaded']} downloaded, {obj['failed']} failed\n"
+            )
+
+        total_mb = stats["total_size_bytes"] / (1024 * 1024)
+        message = (
+            f"Attachment download completed!\n\n"
+            f"Total Attachments Found:   {stats['total_attachments']}\n"
+            f"Successfully Downloaded:   {stats['successful_downloads']}\n"
+            f"Failed:                    {stats['failed_downloads']}\n"
+            f"Total Size:                {total_mb:.2f} MB\n\n"
+            f"Per-object breakdown:\n{obj_lines}\n"
+            f"CSV File:     {output_path}\n"
+            f"Files Folder: {attachments_folder}\n\n"
+            f"💡 CSV is DataLoader-ready for migration!"
+        )
+        messagebox.showinfo("Download Done", message)
+
+        print("\n" + "=" * 70)
+        print("✅ ATTACHMENT EXPORT COMPLETED")
+        print("=" * 70)
+        print(f"Runtime:                   {runtime_formatted}")
+        print(f"Total Attachments Found:   {stats['total_attachments']}")
+        print(f"✅ Successfully Downloaded: {stats['successful_downloads']}")
+        print(f"❌ Failed:                  {stats['failed_downloads']}")
+        print(f"Total Size:                {total_mb:.2f} MB")
+        for obj in stats.get("objects_processed", []):
+            print(f"  • {obj['object']}: {obj['downloaded']} ok, {obj['failed']} failed")
+        if stats.get("failed_files"):
+            print("\n❌ FAILED FILES:")
+            for ff in stats["failed_files"]:
+                print(f"   • {ff['filename']} (ID: {ff['id']}): {ff['reason']}")
+        print("=" * 70)
+
+        self.button_manager.end_operation()
+
+
+    def _on_download_attachments_error(self, error_message):
+        """Called when attachment download fails."""
+        self.update_status(f"❌ ATTACHMENT DOWNLOAD ERROR: {error_message}")
+        messagebox.showerror(
+            "Download Error",
+            f"A fatal error occurred during attachment download:\n\n{error_message}"
+        )
+        self.button_manager.end_operation()
+
+
+    # ==================================
     # Utility Methods
     # ==================================
 
@@ -2332,6 +2476,7 @@ class SalesforceExporterGUI(ctk.CTk):
             self.picklist_exporter = None
             self.metadata_exporter = None
             self.content_document_exporter = None
+            self.attachment_exporter = None
             self.selected_objects.clear()
             self.all_org_objects.clear()
             self.soql_runner = None
