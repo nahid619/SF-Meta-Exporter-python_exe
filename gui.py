@@ -339,6 +339,26 @@ class SalesforceExporterGUI(ctk.CTk):
 
         _activity_log(bp, "login_status_textbox", br)
 
+        # ── Reset / Clear Session button ─────────────────────────────────────
+        # Mirrors the "↻ Reset / Switch Org" button in the web app.
+        # Clears the saved Consumer Key and any cached state so the user can
+        # start completely fresh — useful after a failed login or when switching
+        # between orgs.
+        self.reset_session_btn = ctk.CTkButton(
+            bp,
+            text="↻  Reset / Clear Saved Session",
+            command=self._reset_session_action,
+            height=32,
+            font=ctk.CTkFont(size=12),
+            fg_color="transparent",
+            hover_color=("gray85", "gray25"),
+            border_width=1,
+            border_color=("gray70", "gray40"),
+            text_color=("gray40", "gray65"),
+            corner_radius=6,
+        )
+        self.reset_session_btn.grid(row=br + 1, column=0, sticky="ew", pady=(6, 0))
+
 
     def _on_custom_domain_toggle(self):
         """Show / hide the custom-domain entry when the checkbox changes."""
@@ -471,9 +491,24 @@ class SalesforceExporterGUI(ctk.CTk):
             "                         http://localhost:8890/callback\n"
             "                         http://localhost:8891/callback\n"
             "                         http://localhost:8892/callback\n"
-            "         (add all five — one per line. More is better;\n"
-            "          the app tries 8888 first, then 8889, 8890... up to 8907\n"
-            "          if earlier ports are busy on your machine)\n"
+            "                         http://localhost:8893/callback\n"
+            "                         http://localhost:8894/callback\n"
+            "                         http://localhost:8895/callback\n"
+            "                         http://localhost:8896/callback\n"
+            "                         http://localhost:8897/callback\n"
+            "                         http://localhost:8898/callback\n"
+            "                         http://localhost:8899/callback\n"
+            "                         http://localhost:8900/callback\n"
+            "                         http://localhost:8901/callback\n"
+            "                         http://localhost:8902/callback\n"
+            "                         http://localhost:8903/callback\n"
+            "                         http://localhost:8904/callback\n"
+            "                         http://localhost:8905/callback\n"
+            "                         http://localhost:8906/callback\n"
+            "                         http://localhost:8907/callback\n"
+            "         (add all 20 — one per line.\n"
+            "          The app tries 8888 first, then 8889... up to 8907\n"
+            "          in case an earlier port is already busy on your machine)\n"
             "       • OAuth Scopes: add ‘Full access (full)’\n"
             "                        add ‘Perform requests at any time (refresh_token)’\n"
             
@@ -631,10 +666,28 @@ class SalesforceExporterGUI(ctk.CTk):
             detail = (
                 "🔗 Callback URL Mismatch\n\n"
                 "The redirect URL is not registered in your External Client App.\n\n"
-                "Fix: Click ⚙ and verify these callback URLs are added to your ECA:\n"
+                "Fix: Click ⚙ and verify ALL 20 callback URLs are in your ECA:\n"
                 "  http://localhost:8888/callback\n"
                 "  http://localhost:8889/callback\n"
-                "  http://localhost:8890/callback\n\n"
+                "  http://localhost:8890/callback\n"
+                "  http://localhost:8891/callback\n"
+                "  http://localhost:8892/callback\n"
+                "  http://localhost:8893/callback\n"
+                "  http://localhost:8894/callback\n"
+                "  http://localhost:8895/callback\n"
+                "  http://localhost:8896/callback\n"
+                "  http://localhost:8897/callback\n"
+                "  http://localhost:8898/callback\n"
+                "  http://localhost:8899/callback\n"
+                "  http://localhost:8900/callback\n"
+                "  http://localhost:8901/callback\n"
+                "  http://localhost:8902/callback\n"
+                "  http://localhost:8903/callback\n"
+                "  http://localhost:8904/callback\n"
+                "  http://localhost:8905/callback\n"
+                "  http://localhost:8906/callback\n"
+                "  http://localhost:8907/callback\n"
+                "  (ports 8888-8907 — all must be registered)\n\n"
                 f"Technical detail: {error_msg}"
             )
         elif any(x in err_lower for x in ["nameresolutionerror", "getaddrinfo", "connection"]):
@@ -662,6 +715,64 @@ class SalesforceExporterGUI(ctk.CTk):
         messagebox.showerror("Browser Login Failed", detail)
         self.update_status(f"❌ Browser login failed: {error_msg}")
 
+
+    def _reset_session_action(self):
+        """
+        Clear the saved Consumer Key and reset login UI state.
+
+        Mirrors the web app's "↻ Reset / Switch Org" button.
+        Does three things:
+          1. Wipes the Consumer Key from sfmetaexporter_settings.json
+          2. Clears the activity log textbox
+          3. Resets the login button text/state in case it got stuck
+
+        Does NOT log the user out of their browser — that's not needed for
+        the desktop app because each login opens a fresh browser tab anyway.
+        """
+        from config import save_settings
+
+        confirm = messagebox.askyesno(
+            "Reset Session",
+            "This will clear your saved Consumer Key and reset the login form.\n\n"
+            "You will need to paste your Consumer Key again to log in.\n\n"
+            "Continue?",
+        )
+        if not confirm:
+            return
+
+        # 1. Wipe the saved Consumer Key from disk
+        try:
+            save_settings({"oauth_client_id": ""})
+        except Exception as e:
+            print(f"Warning: could not clear settings: {e}")
+
+        # 2. Reset the login button in case it got stuck in a loading state
+        try:
+            self.oauth_button.configure(
+                state="normal",
+                text="🌐  Login via Browser",
+            )
+        except Exception:
+            pass
+        try:
+            self.oauth_setup_btn.configure(state="normal")
+        except Exception:
+            pass
+
+        # 3. Clear the activity log
+        try:
+            self.login_status_textbox.configure(state="normal")
+            self.login_status_textbox.delete("1.0", "end")
+            self.login_status_textbox.insert("end", "[ready] Session cleared. Paste your Consumer Key and try again.\n")
+            self.login_status_textbox.configure(state="disabled")
+        except Exception:
+            pass
+
+        messagebox.showinfo(
+            "Session Cleared",
+            "Consumer Key cleared.\n\n"
+            "Click ⚙ to enter a new Consumer Key, then try logging in again.",
+        )
 
     def _show_login_status(self, message: str, color: str = "gray"):
         """Show status message during login — writes to login_status_textbox."""

@@ -357,12 +357,12 @@ pip install pyinstaller
 
 **Recommended (most portable):**
 ```bash
-pyinstaller --onefile --windowed --name "SF_Meta_Exporter" --icon=app_icon.ico main.py
+pyinstaller --onefile --windowed --name "SF Meta Exporter" --icon=app_icon.ico main.py
 ```
 
 **Alternative (faster startup):**
 ```bash
-pyinstaller --windowed --name "SF_Meta_Exporter" --icon=app_icon.ico main.py
+pyinstaller --windowed --name "SF Meta Exporter" --icon=app_icon.ico main.py
 ```
 
 ### Build Options
