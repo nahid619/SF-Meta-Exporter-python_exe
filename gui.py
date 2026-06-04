@@ -334,24 +334,23 @@ class SalesforceExporterGUI(ctk.CTk):
         self.oauth_setup_btn.grid(row=0, column=1)
 
         ctk.CTkLabel(bp,
-                     text="Opens Salesforce login in your browser — supports any org, MFA, and SSO. No token needed.",
+                     text="Opens a secure login window — supports any org, MFA, and SSO. No token needed.",
                      font=HINT_FONT, text_color=("gray45", "gray60"),
                      anchor="center", wraplength=600
-                     ).grid(row=br, column=0, pady=(0, 8));  br += 1
+                     ).grid(row=br, column=0, pady=(0, 6));  br += 1
 
-        _activity_log(bp, "login_status_textbox", br)
-
-        # ── Reset / Clear Session button ─────────────────────────────────────
-        # Mirrors the "↻ Reset / Switch Org" button in the web app.
-        # Clears the saved Consumer Key and any cached state so the user can
-        # start completely fresh — useful after a failed login or when switching
-        # between orgs.
+        # ── Reset button — sits directly below the login button row ──────────
+        # Immediately visible when the login button gets stuck in the
+        # "⏳ Waiting..." state after a failed or cancelled login attempt.
+        # Does NOT wipe the Consumer Key — only unsticks the button and clears
+        # the activity log so the user can retry without re-entering their key.
+        # To change the Consumer Key, use the ⚙ gear dialog instead.
         self.reset_session_btn = ctk.CTkButton(
             bp,
-            text="↻  Reset / Clear Saved Session",
+            text="↻  Stuck? Reset Login Button",
             command=self._reset_session_action,
-            height=32,
-            font=ctk.CTkFont(size=12),
+            height=30,
+            font=ctk.CTkFont(size=11),
             fg_color="transparent",
             hover_color=("gray85", "gray25"),
             border_width=1,
@@ -359,7 +358,9 @@ class SalesforceExporterGUI(ctk.CTk):
             text_color=("gray40", "gray65"),
             corner_radius=6,
         )
-        self.reset_session_btn.grid(row=br + 1, column=0, sticky="ew", pady=(6, 0))
+        self.reset_session_btn.grid(row=br, column=0, sticky="ew", pady=(0, 10));  br += 1
+
+        _activity_log(bp, "login_status_textbox", br)
 
 
     def _on_custom_domain_toggle(self):
@@ -418,30 +419,59 @@ class SalesforceExporterGUI(ctk.CTk):
             domain = "test" if self.org_type_var.get() == "Sandbox" else "login"
 
         # Disable both buttons while waiting
-        self.oauth_button.configure(state="disabled", text="⏳  Waiting for browser login...")
+        self.oauth_button.configure(state="disabled", text="⏳  Waiting for login window...")
         try:
             self.oauth_setup_btn.configure(state="disabled")
         except Exception:
             pass
-        self.update_status("Opening Salesforce login page in your browser...")
+        self.reset_session_btn.configure(state="normal")   # keep reset always accessible
+        self.update_status("Opening Salesforce login window...")
 
-        def do_oauth():
-            try:
-                flow = OAuthWebFlow(domain=domain, status_callback=self.update_status)
-                token_data = flow.authenticate()
+        # pywebview REQUIRES the main thread — webview.start() must not be
+        # called from a background thread or it raises:
+        #   "pywebview must be run on a main thread"
+        #
+        # Strategy:
+        #   1. Build the OAuthWebFlow object (cheap, no webview yet).
+        #   2. Call flow.open_window() via self.after(0, ...) so webview.start()
+        #      runs on the main thread and blocks until the popup closes,
+        #      putting the auth code into a result queue.
+        #   3. After the window closes, flow.exchange_code() does the HTTP
+        #      token exchange on a background thread (network I/O).
+        #   4. Result comes back to the main thread via self.after(0, ...).
 
-                self.sf_client = SalesforceClient.from_session(
-                    session_id=token_data["access_token"],
-                    instance_url=token_data["instance_url"],
-                    status_callback=self.update_status,
-                )
-                self.after(0, self._on_oauth_login_success)
+        try:
+            flow = OAuthWebFlow(domain=domain, status_callback=self.update_status)
+        except Exception as e:
+            err_msg = str(e)
+            self._on_oauth_login_error(err_msg)
+            return
 
-            except Exception as e:
-                self.after(0, lambda: self._on_oauth_login_error(str(e)))
+        def _on_webview_done(result):
+            """Called on the main thread after the webview window closes."""
+            kind, value = result
+            if kind == "error":
+                self._on_oauth_login_error(value)
+                return
+            auth_code = value
+            def do_exchange():
+                try:
+                    token_data = flow.exchange_code(auth_code)
+                    self.sf_client = SalesforceClient.from_session(
+                        session_id=token_data["access_token"],
+                        instance_url=token_data["instance_url"],
+                        status_callback=self.update_status,
+                    )
+                    self.after(0, self._on_oauth_login_success)
+                except Exception as e:
+                    err_msg = str(e)
+                    self.after(0, lambda m=err_msg: self._on_oauth_login_error(m))
+            from threading_helper import ThreadHelper
+            ThreadHelper.run_in_thread(do_exchange)
 
-        from threading_helper import ThreadHelper
-        ThreadHelper.run_in_thread(do_oauth)
+        # Schedule webview.start() on the main thread immediately after this
+        # method returns control to the Tkinter event loop.
+        self.after(0, lambda: flow.open_window(callback=_on_webview_done))
 
     def _open_oauth_setup_dialog(self):
         """
@@ -489,28 +519,8 @@ class SalesforceExporterGUI(ctk.CTk):
             "\n"
             "7.  Click ‘Enable OAuth’ and fill in:\n"
             "       • Callback URL:  http://localhost:8888/callback\n"
-            "                         http://localhost:8889/callback\n"
-            "                         http://localhost:8890/callback\n"
-            "                         http://localhost:8891/callback\n"
-            "                         http://localhost:8892/callback\n"
-            "                         http://localhost:8893/callback\n"
-            "                         http://localhost:8894/callback\n"
-            "                         http://localhost:8895/callback\n"
-            "                         http://localhost:8896/callback\n"
-            "                         http://localhost:8897/callback\n"
-            "                         http://localhost:8898/callback\n"
-            "                         http://localhost:8899/callback\n"
-            "                         http://localhost:8900/callback\n"
-            "                         http://localhost:8901/callback\n"
-            "                         http://localhost:8902/callback\n"
-            "                         http://localhost:8903/callback\n"
-            "                         http://localhost:8904/callback\n"
-            "                         http://localhost:8905/callback\n"
-            "                         http://localhost:8906/callback\n"
-            "                         http://localhost:8907/callback\n"
-            "         (add all 20 — one per line.\n"
-            "          The app tries 8888 first, then 8889... up to 8907\n"
-            "          in case an earlier port is already busy on your machine)\n"
+            "         (Only ONE URL needed — the login popup intercepts the\n"
+            "          redirect internally, no local server required)\n"
             "       • OAuth Scopes: add ‘Full access (full)’\n"
             "                        add ‘Perform requests at any time (refresh_token)’\n"
             
@@ -629,7 +639,7 @@ class SalesforceExporterGUI(ctk.CTk):
 
         err_lower = error_msg.lower()
 
-        if any(x in err_lower for x in ["app_not_found", "not installed", "oauth_ec_app_not_found"]):
+        if any(x in err_lower for x in ["app_not_found", "oauth_ec_app_not_found"]):
             detail = (
                 "❌ Consumer Key Does Not Match This Org\n\n"
                 "The Consumer Key saved in settings belongs to a different Salesforce org.\n\n"
@@ -668,28 +678,26 @@ class SalesforceExporterGUI(ctk.CTk):
             detail = (
                 "🔗 Callback URL Mismatch\n\n"
                 "The redirect URL is not registered in your External Client App.\n\n"
-                "Fix: Click ⚙ and verify ALL 20 callback URLs are in your ECA:\n"
-                "  http://localhost:8888/callback\n"
-                "  http://localhost:8889/callback\n"
-                "  http://localhost:8890/callback\n"
-                "  http://localhost:8891/callback\n"
-                "  http://localhost:8892/callback\n"
-                "  http://localhost:8893/callback\n"
-                "  http://localhost:8894/callback\n"
-                "  http://localhost:8895/callback\n"
-                "  http://localhost:8896/callback\n"
-                "  http://localhost:8897/callback\n"
-                "  http://localhost:8898/callback\n"
-                "  http://localhost:8899/callback\n"
-                "  http://localhost:8900/callback\n"
-                "  http://localhost:8901/callback\n"
-                "  http://localhost:8902/callback\n"
-                "  http://localhost:8903/callback\n"
-                "  http://localhost:8904/callback\n"
-                "  http://localhost:8905/callback\n"
-                "  http://localhost:8906/callback\n"
-                "  http://localhost:8907/callback\n"
-                "  (ports 8888-8907 — all must be registered)\n\n"
+                "Fix: Click ⚙ and verify this callback URL is in your ECA:\n"
+                "  http://localhost:8888/callback\n\n"
+                f"Technical detail: {error_msg}"
+            )
+        elif "no module named" in err_lower and "webview" in err_lower:
+            detail = (
+                "📦 Missing Dependency: pywebview\n\n"
+                "The login window requires the pywebview library.\n\n"
+                "Fix:\n"
+                "  pip install pywebview\n\n"
+                "Then restart the application."
+            )
+        elif "webview2" in err_lower or ("pywebview" in err_lower and "import" in err_lower):
+            detail = (
+                "📦 WebView2 Runtime Missing\n\n"
+                "pywebview is installed but the Microsoft WebView2 Runtime is missing.\n\n"
+                "Fix:\n"
+                "  1. Download and install the WebView2 Runtime from:\n"
+                "     https://developer.microsoft.com/microsoft-edge/webview2/\n"
+                "  2. Restart the application.\n\n"
                 f"Technical detail: {error_msg}"
             )
         elif any(x in err_lower for x in ["nameresolutionerror", "getaddrinfo", "connection"]):
@@ -720,35 +728,18 @@ class SalesforceExporterGUI(ctk.CTk):
 
     def _reset_session_action(self):
         """
-        Clear the saved Consumer Key and reset login UI state.
+        Unstick the login button and clear the activity log so the user can
+        retry login immediately.
 
-        Mirrors the web app's "↻ Reset / Switch Org" button.
-        Does three things:
-          1. Wipes the Consumer Key from sfmetaexporter_settings.json
-          2. Clears the activity log textbox
-          3. Resets the login button text/state in case it got stuck
+        This is specifically for when the login button gets stuck in the
+        "⏳ Waiting..." state after a failed, cancelled, or timed-out login.
 
-        Does NOT log the user out of their browser — that's not needed for
-        the desktop app because each login opens a fresh browser tab anyway.
+        Does NOT wipe the Consumer Key — the key is preserved so the user
+        can retry without re-entering it. To change the Consumer Key, use
+        the ⚙ gear dialog instead.
         """
-        from config import save_settings
-
-        confirm = messagebox.askyesno(
-            "Reset Session",
-            "This will clear your saved Consumer Key and reset the login form.\n\n"
-            "You will need to paste your Consumer Key again to log in.\n\n"
-            "Continue?",
-        )
-        if not confirm:
-            return
-
-        # 1. Wipe the saved Consumer Key from disk
-        try:
-            save_settings({"oauth_client_id": ""})
-        except Exception as e:
-            print(f"Warning: could not clear settings: {e}")
-
-        # 2. Reset the login button in case it got stuck in a loading state
+        # Reset the login button — no confirmation needed, this is a
+        # recovery action, not a destructive one.
         try:
             self.oauth_button.configure(
                 state="normal",
@@ -761,20 +752,16 @@ class SalesforceExporterGUI(ctk.CTk):
         except Exception:
             pass
 
-        # 3. Clear the activity log
+        # Clear the activity log so previous error noise is gone
         try:
             self.login_status_textbox.configure(state="normal")
             self.login_status_textbox.delete("1.0", "end")
-            self.login_status_textbox.insert("end", "[ready] Session cleared. Paste your Consumer Key and try again.\n")
+            self.login_status_textbox.insert("end", "[ready] Login button reset. Try logging in again.\n")
             self.login_status_textbox.configure(state="disabled")
         except Exception:
             pass
 
-        messagebox.showinfo(
-            "Session Cleared",
-            "Consumer Key cleared.\n\n"
-            "Click ⚙ to enter a new Consumer Key, then try logging in again.",
-        )
+        self.update_status("↻ Login button reset. Ready to try again.")
 
     def _show_login_status(self, message: str, color: str = "gray"):
         """Show status message during login — writes to login_status_textbox."""
