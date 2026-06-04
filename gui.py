@@ -426,11 +426,11 @@ class SalesforceExporterGUI(ctk.CTk):
             pass
         self.reset_session_btn.configure(state="normal")   # keep reset always accessible
         self.update_status("Opening Salesforce login window...")
-        # Hide the main window while the login popup is open.
-        # This prevents Windows from showing it as "Not Responding" (which
-        # happens because webview.start() blocks the Tkinter message loop).
-        # The window is shown again in _on_oauth_login_success/_error.
-        self.withdraw()
+        # Show a "login in progress" overlay instead of hiding the window.
+        # This keeps the EXE visible so users know the app is still alive.
+        # The overlay is frozen while webview.start() blocks the event loop —
+        # that's intentional; the user is busy with the Salesforce popup.
+        self._show_login_overlay()
 
         # pywebview REQUIRES the main thread — webview.start() must not be
         # called from a background thread or it raises:
@@ -627,7 +627,7 @@ class SalesforceExporterGUI(ctk.CTk):
 
     def _on_oauth_login_success(self):
         """Called on the main thread after a successful OAuth browser login."""
-        self.deiconify()   # restore main window hidden during login popup
+        self._hide_login_overlay()   # restore main window hidden during login popup
         self.oauth_button.configure(state="normal", text="🌐  Login via Browser")
         try:
             self.oauth_setup_btn.configure(state="normal")
@@ -637,7 +637,7 @@ class SalesforceExporterGUI(ctk.CTk):
 
     def _on_oauth_login_error(self, error_msg: str):
         """Called on the main thread when OAuth browser login fails."""
-        self.deiconify()   # restore main window hidden during login popup
+        self._hide_login_overlay()    # restore main window hidden during login popup
         self.oauth_button.configure(state="normal", text="🌐  Login via Browser")
         try:
             self.oauth_setup_btn.configure(state="normal")
@@ -783,6 +783,77 @@ class SalesforceExporterGUI(ctk.CTk):
         except Exception as e:
             print(f"Status update error: {e}")
         
+
+
+    def _show_login_overlay(self):
+        """
+        Replace self.withdraw() — keeps the window visible but covers it with
+        a clear 'login in progress' panel so users know the app is working.
+        Since webview.start() blocks the Tkinter event loop, the overlay will
+        be frozen in place (non-interactive) which is intentional.
+        """
+        self._login_overlay = ctk.CTkFrame(self, fg_color=("gray92", "gray13"), corner_radius=0)
+        self._login_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._login_overlay.lift()
+
+        # Centre card
+        card = ctk.CTkFrame(self._login_overlay, corner_radius=18, width=420)
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        card.grid_columnconfigure(0, weight=1)
+
+        # Icon row
+        ctk.CTkLabel(
+            card, text="🌐",
+            font=ctk.CTkFont(size=52),
+        ).grid(row=0, column=0, pady=(32, 6))
+
+        # Heading
+        ctk.CTkLabel(
+            card,
+            text="Browser Login in Progress",
+            font=ctk.CTkFont(size=19, weight="bold"),
+        ).grid(row=1, column=0, padx=40)
+
+        # Sub-text
+        ctk.CTkLabel(
+            card,
+            text=(
+                "A Salesforce login window has opened.\n"
+                "Complete your login there — this window\n"
+                "will continue automatically once you're in."
+            ),
+            font=ctk.CTkFont(size=13),
+            text_color=("gray40", "gray60"),
+            justify="center",
+        ).grid(row=2, column=0, padx=40, pady=(10, 10))
+
+        # Divider
+        ctk.CTkFrame(card, height=1, fg_color=("gray80", "gray30")).grid(
+            row=3, column=0, sticky="ew", padx=30, pady=(0, 14)
+        )
+
+        # Hint
+        ctk.CTkLabel(
+            card,
+            text="Do not close this window.",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray55", "gray50"),
+        ).grid(row=4, column=0, pady=(0, 28))
+
+        # Force render BEFORE webview.start() blocks the event loop
+        self.update()
+
+
+    def _hide_login_overlay(self):
+        """Remove the overlay after login completes (success or error)."""
+        try:
+            if hasattr(self, "_login_overlay") and self._login_overlay:
+                self._login_overlay.destroy()
+                self._login_overlay = None
+        except Exception:
+            pass
+
+
 
 
     def _on_login_success(self):
