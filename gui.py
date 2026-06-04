@@ -426,6 +426,11 @@ class SalesforceExporterGUI(ctk.CTk):
             pass
         self.reset_session_btn.configure(state="normal")   # keep reset always accessible
         self.update_status("Opening Salesforce login window...")
+        # Hide the main window while the login popup is open.
+        # This prevents Windows from showing it as "Not Responding" (which
+        # happens because webview.start() blocks the Tkinter message loop).
+        # The window is shown again in _on_oauth_login_success/_error.
+        self.withdraw()
 
         # pywebview REQUIRES the main thread — webview.start() must not be
         # called from a background thread or it raises:
@@ -622,6 +627,7 @@ class SalesforceExporterGUI(ctk.CTk):
 
     def _on_oauth_login_success(self):
         """Called on the main thread after a successful OAuth browser login."""
+        self.deiconify()   # restore main window hidden during login popup
         self.oauth_button.configure(state="normal", text="🌐  Login via Browser")
         try:
             self.oauth_setup_btn.configure(state="normal")
@@ -631,6 +637,7 @@ class SalesforceExporterGUI(ctk.CTk):
 
     def _on_oauth_login_error(self, error_msg: str):
         """Called on the main thread when OAuth browser login fails."""
+        self.deiconify()   # restore main window hidden during login popup
         self.oauth_button.configure(state="normal", text="🌐  Login via Browser")
         try:
             self.oauth_setup_btn.configure(state="normal")
@@ -2424,6 +2431,10 @@ class SalesforceExporterGUI(ctk.CTk):
     # Utility Methods
     # ==================================
 
+    def _log(self, message: str):
+        """Alias for update_status — used by sub-frames."""
+        self.update_status(message)
+
     def update_status(self, message: str, verbose: bool = False):
         """Updates the status text box. Also mirrors to the login activity log when visible."""
         timestamp = datetime.now().strftime("[%H:%M:%S]")
@@ -2451,7 +2462,20 @@ class SalesforceExporterGUI(ctk.CTk):
                 pass
 
         if not verbose:
-            print(display_message)
+            # Double-layered safety:
+            # Layer 1 — try normal print (works if main.py fixed encoding)
+            # Layer 2 — fall back to ASCII-safe version
+            # Layer 3 — silently swallow if stdout is None (windowed exe)
+            try:
+                print(display_message)
+            except Exception:
+                try:
+                    import sys as _sys
+                    if _sys.stdout is not None:
+                        safe = display_message.encode('ascii', errors='replace').decode('ascii')
+                        print(safe)
+                except Exception:
+                    pass  # windowed exe with no console — give up silently
 
         self.update_idletasks()
 
