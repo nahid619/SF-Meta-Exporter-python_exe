@@ -4,6 +4,7 @@
 # ===== UI Framework =====
 customtkinter>=5.2.0
 darkdetect>=0.8.0
+pywebview
 
 # ===== Salesforce API =====
 requests>=2.31.0
