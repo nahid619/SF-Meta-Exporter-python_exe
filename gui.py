@@ -426,39 +426,42 @@ class SalesforceExporterGUI(ctk.CTk):
             pass
         self.reset_session_btn.configure(state="normal")   # keep reset always accessible
         self.update_status("Opening Salesforce login window...")
-        # Show a "login in progress" overlay instead of hiding the window.
-        # This keeps the EXE visible so users know the app is still alive.
-        # The overlay is frozen while webview.start() blocks the event loop —
-        # that's intentional; the user is busy with the Salesforce popup.
-        self._show_login_overlay()
 
-        # pywebview REQUIRES the main thread — webview.start() must not be
-        # called from a background thread or it raises:
-        #   "pywebview must be run on a main thread"
+        # ── Why "Not Responding" happens with a visible frozen window ─────────
+        # webview.start() must run on threading.current_thread().name=='MainThread'
+        # (pywebview checks the thread NAME literally — cannot be worked around).
+        # While it blocks, Tkinter cannot process Windows messages (WM_PAINT,
+        # WM_NCHITTEST, etc.).  After ~5 s Windows marks any VISIBLE window
+        # "Not Responding" and grays it out.  Double-clicking makes it worse.
         #
-        # Strategy:
-        #   1. Build the OAuthWebFlow object (cheap, no webview yet).
-        #   2. Call flow.open_window() via self.after(0, ...) so webview.start()
-        #      runs on the main thread and blocks until the popup closes,
-        #      putting the auth code into a result queue.
-        #   3. After the window closes, flow.exchange_code() does the HTTP
-        #      token exchange on a background thread (network I/O).
-        #   4. Result comes back to the main thread via self.after(0, ...).
+        # ── The correct fix: withdraw() before webview.start() ────────────────
+        # A withdrawn (hidden) window receives NO Windows messages at all, so
+        # Windows has nothing to flag.  webview.start() still runs on MainThread
+        # as required.  We restore the window with deiconify() the instant the
+        # popup closes — the user sees it disappear briefly, then reappear.
+        #
+        # Steps:
+        #   1. withdraw() — hide the main window.
+        #   2. after(0) — yield one event-loop tick so withdraw() is rendered,
+        #      THEN call flow.open_window() on this same MainThread.
+        #      webview.start() blocks here; hidden window = no OS complaint.
+        #   3. Popup closes → open_window() returns → callback fires on MainThread.
+        #   4. deiconify() restores the window; token exchange runs in background.
 
         try:
             flow = OAuthWebFlow(domain=domain, status_callback=self.update_status)
         except Exception as e:
-            err_msg = str(e)
-            self._on_oauth_login_error(err_msg)
+            self._on_oauth_login_error(str(e))
             return
 
         def _on_webview_done(result):
-            """Called on the main thread after the webview window closes."""
+            """Called on the MainThread the moment the webview popup closes."""
             kind, value = result
             if kind == "error":
                 self._on_oauth_login_error(value)
                 return
             auth_code = value
+
             def do_exchange():
                 try:
                     token_data = flow.exchange_code(auth_code)
@@ -471,11 +474,17 @@ class SalesforceExporterGUI(ctk.CTk):
                 except Exception as e:
                     err_msg = str(e)
                     self.after(0, lambda m=err_msg: self._on_oauth_login_error(m))
+
             from threading_helper import ThreadHelper
             ThreadHelper.run_in_thread(do_exchange)
 
-        # Schedule webview.start() on the main thread immediately after this
-        # method returns control to the Tkinter event loop.
+            # ✅ NEW: Show "Connecting..." popup NOW.
+            # Safe because do_exchange() is in a background thread —
+            # the main thread is free and this Toplevel is fully responsive.
+            self._show_processing_overlay()
+        
+         # ✅ THESE TWO LINES WERE MISSING — add them here:
+        self.withdraw()   # Hide main window → no "Not Responding" while webview blocks
         self.after(0, lambda: flow.open_window(callback=_on_webview_done))
 
     def _open_oauth_setup_dialog(self):
@@ -627,7 +636,7 @@ class SalesforceExporterGUI(ctk.CTk):
 
     def _on_oauth_login_success(self):
         """Called on the main thread after a successful OAuth browser login."""
-        self._hide_login_overlay()   # restore main window hidden during login popup
+        self._hide_processing_overlay()   # ✅ hides popup + deiconifies main window
         self.oauth_button.configure(state="normal", text="🌐  Login via Browser")
         try:
             self.oauth_setup_btn.configure(state="normal")
@@ -637,7 +646,7 @@ class SalesforceExporterGUI(ctk.CTk):
 
     def _on_oauth_login_error(self, error_msg: str):
         """Called on the main thread when OAuth browser login fails."""
-        self._hide_login_overlay()    # restore main window hidden during login popup
+        self._hide_processing_overlay()
         self.oauth_button.configure(state="normal", text="🌐  Login via Browser")
         try:
             self.oauth_setup_btn.configure(state="normal")
@@ -785,71 +794,12 @@ class SalesforceExporterGUI(ctk.CTk):
         
 
 
-    def _show_login_overlay(self):
-        """
-        Replace self.withdraw() — keeps the window visible but covers it with
-        a clear 'login in progress' panel so users know the app is working.
-        Since webview.start() blocks the Tkinter event loop, the overlay will
-        be frozen in place (non-interactive) which is intentional.
-        """
-        self._login_overlay = ctk.CTkFrame(self, fg_color=("gray92", "gray13"), corner_radius=0)
-        self._login_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
-        self._login_overlay.lift()
-
-        # Centre card
-        card = ctk.CTkFrame(self._login_overlay, corner_radius=18, width=420)
-        card.place(relx=0.5, rely=0.5, anchor="center")
-        card.grid_columnconfigure(0, weight=1)
-
-        # Icon row
-        ctk.CTkLabel(
-            card, text="🌐",
-            font=ctk.CTkFont(size=52),
-        ).grid(row=0, column=0, pady=(32, 6))
-
-        # Heading
-        ctk.CTkLabel(
-            card,
-            text="Browser Login in Progress",
-            font=ctk.CTkFont(size=19, weight="bold"),
-        ).grid(row=1, column=0, padx=40)
-
-        # Sub-text
-        ctk.CTkLabel(
-            card,
-            text=(
-                "A Salesforce login window has opened.\n"
-                "Complete your login there — this window\n"
-                "will continue automatically once you're in."
-            ),
-            font=ctk.CTkFont(size=13),
-            text_color=("gray40", "gray60"),
-            justify="center",
-        ).grid(row=2, column=0, padx=40, pady=(10, 10))
-
-        # Divider
-        ctk.CTkFrame(card, height=1, fg_color=("gray80", "gray30")).grid(
-            row=3, column=0, sticky="ew", padx=30, pady=(0, 14)
-        )
-
-        # Hint
-        ctk.CTkLabel(
-            card,
-            text="Do not close this window.",
-            font=ctk.CTkFont(size=11),
-            text_color=("gray55", "gray50"),
-        ).grid(row=4, column=0, pady=(0, 28))
-
-        # Force render BEFORE webview.start() blocks the event loop
-        self.update()
-
 
     def _hide_login_overlay(self):
-        """Remove the overlay after login completes (success or error)."""
+        """Restore the main window after login completes."""
+        self._webview_running = False
         try:
-            if hasattr(self, "_login_overlay") and self._login_overlay:
-                self._login_overlay.destroy()
-                self._login_overlay = None
+            self.deiconify()   # Bring window back — login is done
         except Exception:
             pass
 
@@ -2629,6 +2579,92 @@ class SalesforceExporterGUI(ctk.CTk):
                 print(f"⚠️ Error destroying report frame: {e}")
             finally:
                 self.report_exporter_frame = None
+                
+                
+                
+    def _show_processing_overlay(self):
+        try:
+            self._processing_overlay = ctk.CTkToplevel(self)
+            self._processing_overlay.overrideredirect(True)
+            self._processing_overlay.attributes("-topmost", True)
+            self._processing_overlay.resizable(False, False)
+
+            # ✅ THE WINDOW ITSELF IS THE BLUE BORDER
+            # padx=8, pady=8 on the card = equal 8px blue gap on all 4 sides
+            self._processing_overlay.configure(fg_color="#009EDB")
+
+            # Card sits inside with equal padding — that padding IS the blue border
+            card = ctk.CTkFrame(
+                self._processing_overlay,
+                fg_color=("#ffffff", "#1e1e1e"),
+                corner_radius=14
+            )
+            card.pack(padx=8, pady=8)
+
+            # Icon
+            ctk.CTkLabel(
+                card,
+                text="🔐",
+                font=ctk.CTkFont(size=38),
+            ).pack(pady=(22, 4))
+
+            # Heading
+            ctk.CTkLabel(
+                card,
+                text="Connecting to Salesforce...",
+                font=ctk.CTkFont(size=15, weight="bold"),
+            ).pack(padx=36)
+
+            # Sub-text
+            ctk.CTkLabel(
+                card,
+                text="Login successful. Verifying your session,\nthis takes just a moment.",
+                font=ctk.CTkFont(size=12),
+                text_color=("gray45", "gray60"),
+                justify="center",
+            ).pack(padx=36, pady=(8, 6))
+
+            # Divider
+            ctk.CTkFrame(card, height=1, fg_color=("gray80", "gray30")).pack(
+                fill="x", padx=24, pady=(0, 10)
+            )
+
+            # Footer
+            ctk.CTkLabel(
+                card,
+                text="Please wait — do not close the application.",
+                font=ctk.CTkFont(size=10),
+                text_color=("gray55", "gray50"),
+            ).pack(pady=(0, 20))
+
+            # Centre on screen
+            self._processing_overlay.update_idletasks()
+            w = self._processing_overlay.winfo_reqwidth()
+            h = self._processing_overlay.winfo_reqheight()
+            sx = self.winfo_screenwidth()
+            sy = self.winfo_screenheight()
+            self._processing_overlay.geometry(
+                f"{w}x{h}+{(sx - w) // 2}+{(sy - h) // 2}"
+            )
+            self._processing_overlay.update()
+
+        except Exception as e:
+            print(f"⚠️ Could not show processing overlay: {e}")
+            self._processing_overlay = None
+
+    def _hide_processing_overlay(self):
+        """Destroy the 'Connecting...' popup and restore the main window."""
+        self._webview_running = False
+        try:
+            if getattr(self, "_processing_overlay", None):
+                self._processing_overlay.destroy()
+                self._processing_overlay = None
+        except Exception:
+            pass
+        try:
+            self.deiconify()   # Bring main window back
+        except Exception:
+            pass
 
 
 
