@@ -351,11 +351,11 @@ class SalesforceExporterGUI(ctk.CTk):
             command=self._reset_session_action,
             height=30,
             font=ctk.CTkFont(size=11),
-            fg_color="transparent",
-            hover_color=("gray85", "gray25"),
+            fg_color=("gray75", "gray35"),
+            hover_color=("gray65", "gray25"),
             border_width=1,
             border_color=("gray70", "gray40"),
-            text_color=("gray40", "gray65"),
+            text_color=("gray15", "gray85"),
             corner_radius=6,
         )
         self.reset_session_btn.grid(row=br, column=0, sticky="ew", pady=(0, 10));  br += 1
@@ -744,18 +744,29 @@ class SalesforceExporterGUI(ctk.CTk):
 
     def _reset_session_action(self):
         """
-        Unstick the login button and clear the activity log so the user can
-        retry login immediately.
+        Full reset: unstick the login button, clear the activity log, remove
+        the saved Consumer Key from the JSON settings file, and restore the
+        main window if it was hidden.
 
-        This is specifically for when the login button gets stuck in the
-        "⏳ Waiting..." state after a failed, cancelled, or timed-out login.
-
-        Does NOT wipe the Consumer Key — the key is preserved so the user
-        can retry without re-entering it. To change the Consumer Key, use
-        the ⚙ gear dialog instead.
+        Use this when the login button is stuck OR you want to start the
+        one-time setup from scratch.  After reset the user must re-enter
+        their Consumer Key via the ⚙ gear dialog.
         """
-        # Reset the login button — no confirmation needed, this is a
-        # recovery action, not a destructive one.
+        # ── 1. Restore the main window in case withdraw() left it hidden ──
+        try:
+            self.deiconify()
+        except Exception:
+            pass
+
+        # ── 2. Destroy the processing overlay if it is still showing ──────
+        try:
+            if getattr(self, "_processing_overlay", None):
+                self._processing_overlay.destroy()
+                self._processing_overlay = None
+        except Exception:
+            pass
+
+        # ── 3. Re-enable the login buttons ────────────────────────────────
         try:
             self.oauth_button.configure(
                 state="normal",
@@ -768,16 +779,26 @@ class SalesforceExporterGUI(ctk.CTk):
         except Exception:
             pass
 
-        # Clear the activity log so previous error noise is gone
+        # ── 4. Wipe the saved Consumer Key from the JSON settings file ─────
+        try:
+            set_oauth_client_id("")
+        except Exception:
+            pass
+
+        # ── 5. Clear the activity log ──────────────────────────────────────
         try:
             self.login_status_textbox.configure(state="normal")
             self.login_status_textbox.delete("1.0", "end")
-            self.login_status_textbox.insert("end", "[ready] Login button reset. Try logging in again.\n")
+            self.login_status_textbox.insert(
+                "end",
+                "[ready] Reset complete. Consumer Key cleared.\n"
+                "        Click ⚙ to enter your Consumer Key, then log in again.\n"
+            )
             self.login_status_textbox.configure(state="disabled")
         except Exception:
             pass
 
-        self.update_status("↻ Login button reset. Ready to try again.")
+        self.update_status("↻ Reset complete — Consumer Key removed. Use ⚙ to set it up again.")
 
     def _show_login_status(self, message: str, color: str = "gray"):
         """Show status message during login — writes to login_status_textbox."""
