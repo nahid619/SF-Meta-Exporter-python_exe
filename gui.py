@@ -134,6 +134,10 @@ class SalesforceExporterGUI(ctk.CTk):
         # âœ… NEW: Export mode selection variable
         self.export_mode_var = ctk.StringVar(value="single_tab")
         self._logged_in_user = ""   # set after OAuth login succeeds
+        # Stores active filters for the Download Files operation.
+        # Keys: created_from, created_to, modified_from, modified_to,
+        #       file_type, file_extension, title, is_archived
+        self.download_file_filters: dict = {}
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
@@ -1077,9 +1081,11 @@ class SalesforceExporterGUI(ctk.CTk):
         export_buttons_frame.grid_columnconfigure(2, weight=1)
         export_buttons_frame.grid_columnconfigure(3, weight=1)
 
-        # Configure 7 columns with equal weight
-        for i in range(7):
+        # Configure 8 columns — 7 action buttons + 1 narrow filter button
+        for i in range(8):
             export_buttons_frame.grid_columnconfigure(i, weight=1)
+        # Filter button column is narrower; it doesn't expand like the others
+        export_buttons_frame.grid_columnconfigure(3, weight=0, minsize=110)
         
         self.export_picklist_button = ctk.CTkButton(
             export_buttons_frame,
@@ -1109,8 +1115,20 @@ class SalesforceExporterGUI(ctk.CTk):
             fg_color="#2D7BD4",
             font=ctk.CTkFont(size=16, weight="bold")
         )
-        self.download_files_button.grid(row=0, column=2, sticky="ew", padx=(5, 5))
-        
+        self.download_files_button.grid(row=0, column=2, sticky="ew", padx=(5, 2))
+
+        # ── Filter button (narrow, sits right beside Download Files) ─────────
+        self.download_filter_button = ctk.CTkButton(
+            export_buttons_frame,
+            text="🔍 Filter",
+            command=self.open_download_filter_modal,
+            height=50,
+            fg_color="#555E6B",
+            hover_color="#3A4250",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.download_filter_button.grid(row=0, column=3, sticky="ew", padx=(2, 5))
+
         self.run_soql_button = ctk.CTkButton(
             export_buttons_frame,
             text="Run SOQL",
@@ -1119,7 +1137,7 @@ class SalesforceExporterGUI(ctk.CTk):
             fg_color="#2D7BD4",
             font=ctk.CTkFont(size=16, weight="bold")
         )
-        self.run_soql_button.grid(row=0, column=3, sticky="ew", padx=(5, 5))
+        self.run_soql_button.grid(row=0, column=4, sticky="ew", padx=(5, 5))
         
         self.salesforce_switch_button = ctk.CTkButton(
             export_buttons_frame,
@@ -1129,7 +1147,7 @@ class SalesforceExporterGUI(ctk.CTk):
             fg_color="#2D7BD4",
             font=ctk.CTkFont(size=16, weight="bold")
         )
-        self.salesforce_switch_button.grid(row=0, column=4, sticky="ew", padx=(5, 0))
+        self.salesforce_switch_button.grid(row=0, column=5, sticky="ew", padx=(5, 5))
         
         self.report_exporter_button = ctk.CTkButton(
             export_buttons_frame,
@@ -1140,7 +1158,7 @@ class SalesforceExporterGUI(ctk.CTk):
             hover_color="#2D7BD4",
             font=ctk.CTkFont(size=16, weight="bold")
         )
-        self.report_exporter_button.grid(row=0, column=5, sticky="ew", padx=(5, 5))
+        self.report_exporter_button.grid(row=0, column=6, sticky="ew", padx=(5, 5))
 
         self.download_attachments_button = ctk.CTkButton(
             export_buttons_frame,
@@ -1150,17 +1168,18 @@ class SalesforceExporterGUI(ctk.CTk):
             fg_color="#2D7BD4",
             font=ctk.CTkFont(size=16, weight="bold")
         )
-        self.download_attachments_button.grid(row=0, column=6, sticky="ew", padx=(5, 0))
+        self.download_attachments_button.grid(row=0, column=7, sticky="ew", padx=(5, 0))
 
         # Register all buttons with state manager
         self.button_manager.register_buttons({
-            'picklist':    self.export_picklist_button,
-            'metadata':    self.export_metadata_button,
-            'download':    self.download_files_button,
-            'soql':        self.run_soql_button,
-            'switch':      self.salesforce_switch_button,
-            'report':      self.report_exporter_button,
-            'attachments': self.download_attachments_button,
+            'picklist':        self.export_picklist_button,
+            'metadata':        self.export_metadata_button,
+            'download':        self.download_files_button,
+            'download_filter': self.download_filter_button,
+            'soql':            self.run_soql_button,
+            'switch':          self.salesforce_switch_button,
+            'report':          self.report_exporter_button,
+            'attachments':     self.download_attachments_button,
         })
 
 
@@ -2261,6 +2280,197 @@ class SalesforceExporterGUI(ctk.CTk):
 
         # ✅ NEW: Re-enable all buttons
         self.button_manager.end_operation()
+        
+    # ──────────────────────────────────────────────────────────────────────────
+    # Download Files — Filter modal
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def open_download_filter_modal(self):
+        """Open the filter configuration modal for Download Files."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Download Files — Filters")
+        dialog.geometry("500x620")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        dialog.lift()
+        dialog.focus_force()
+
+        f = self.download_file_filters  # shorthand for pre-filling
+
+        # ── Header ───────────────────────────────────────────────────────────
+        ctk.CTkLabel(
+            dialog,
+            text="Download Files Filter",
+            font=ctk.CTkFont(size=17, weight="bold"),
+        ).pack(pady=(18, 2), padx=24, anchor="w")
+
+        ctk.CTkLabel(
+            dialog,
+            text="Narrows the SOQL query before downloading. Leave fields blank to skip a filter.",
+            font=ctk.CTkFont(size=12),
+            text_color=("gray40", "gray60"),
+            wraplength=450,
+            justify="left",
+        ).pack(padx=24, pady=(0, 10), anchor="w")
+
+        # ── Helper: section heading ───────────────────────────────────────────
+        def section(text):
+            ctk.CTkLabel(
+                dialog,
+                text=text,
+                font=ctk.CTkFont(size=13, weight="bold"),
+            ).pack(padx=24, pady=(10, 2), anchor="w")
+
+        # ── Helper: labelled entry row ────────────────────────────────────────
+        def labeled_entry(label: str, default: str = "", placeholder: str = "") -> ctk.CTkEntry:
+            fr = ctk.CTkFrame(dialog, fg_color="transparent")
+            fr.pack(fill="x", padx=24, pady=3)
+            ctk.CTkLabel(fr, text=label, width=160, anchor="w").pack(side="left")
+            entry = ctk.CTkEntry(fr, width=260, placeholder_text=placeholder)
+            entry.pack(side="left", padx=(6, 0))
+            if default:
+                entry.insert(0, default)
+            return entry
+
+        # ── Created Date ──────────────────────────────────────────────────────
+        section("Created Date Range")
+        created_from_entry = labeled_entry(
+            "From (YYYY-MM-DD)", f.get("created_from", ""), "e.g. 2024-01-01"
+        )
+        created_to_entry = labeled_entry(
+            "To   (YYYY-MM-DD)", f.get("created_to", ""),   "e.g. 2024-12-31"
+        )
+
+        # ── Last Modified Date ────────────────────────────────────────────────
+        section("Last Modified Date Range")
+        modified_from_entry = labeled_entry(
+            "From (YYYY-MM-DD)", f.get("modified_from", ""), "e.g. 2024-01-01"
+        )
+        modified_to_entry = labeled_entry(
+            "To   (YYYY-MM-DD)", f.get("modified_to", ""),   "e.g. 2024-12-31"
+        )
+
+        # ── Text LIKE filters ─────────────────────────────────────────────────
+        section("Text Filters  (partial match, case-insensitive)")
+        file_type_entry  = labeled_entry("FileType",      f.get("file_type", ""),      "e.g. PDF")
+        file_ext_entry   = labeled_entry("FileExtension", f.get("file_extension", ""), "e.g. pdf")
+        title_entry      = labeled_entry("Title",         f.get("title", ""),          "e.g. Invoice")
+
+        # ── IsArchived ────────────────────────────────────────────────────────
+        section("Archived Status")
+        archived_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        archived_frame.pack(fill="x", padx=24, pady=3)
+        ctk.CTkLabel(archived_frame, text="IsArchived", width=160, anchor="w").pack(side="left")
+        archived_var = ctk.StringVar(value=f.get("is_archived", "Any"))
+        ctk.CTkOptionMenu(
+            archived_frame,
+            values=["Any", "True", "False"],
+            variable=archived_var,
+            width=120,
+        ).pack(side="left", padx=(6, 0))
+
+        # ── Active filter count indicator ─────────────────────────────────────
+        indicator_var = ctk.StringVar(value=self._filter_indicator_text())
+        ctk.CTkLabel(
+            dialog,
+            textvariable=indicator_var,
+            text_color="#F0A500",
+            font=ctk.CTkFont(size=11),
+        ).pack(pady=(10, 0), padx=24, anchor="w")
+
+        # ── Date validation helper ────────────────────────────────────────────
+        def validate_date(val: str, field_name: str) -> bool:
+            import re
+            if val and not re.match(r"^\d{4}-\d{2}-\d{2}$", val):
+                messagebox.showerror(
+                    "Invalid Date",
+                    f'"{field_name}" must be in YYYY-MM-DD format.\nExample: 2024-06-15',
+                    parent=dialog,
+                )
+                return False
+            return True
+
+        # ── Apply ─────────────────────────────────────────────────────────────
+        def apply_filters():
+            cf = created_from_entry.get().strip()
+            ct = created_to_entry.get().strip()
+            mf = modified_from_entry.get().strip()
+            mt = modified_to_entry.get().strip()
+
+            for val, name in [
+                (cf, "Created From"),
+                (ct, "Created To"),
+                (mf, "Modified From"),
+                (mt, "Modified To"),
+            ]:
+                if not validate_date(val, name):
+                    return
+
+            raw = {
+                "created_from":   cf,
+                "created_to":     ct,
+                "modified_from":  mf,
+                "modified_to":    mt,
+                "file_type":      file_type_entry.get().strip(),
+                "file_extension": file_ext_entry.get().strip(),
+                "title":          title_entry.get().strip(),
+                "is_archived":    archived_var.get(),
+            }
+            # Drop empty / "Any" values — cleaner dict, easier SOQL building
+            self.download_file_filters = {
+                k: v for k, v in raw.items() if v and v != "Any"
+            }
+            self._update_filter_button()
+            dialog.destroy()
+
+        # ── Clear ─────────────────────────────────────────────────────────────
+        def clear_filters():
+            self.download_file_filters = {}
+            self._update_filter_button()
+            dialog.destroy()
+
+        # ── Button row ────────────────────────────────────────────────────────
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=24, pady=(14, 20))
+
+        ctk.CTkButton(
+            btn_frame, text="✅ Apply Filter",
+            command=apply_filters, fg_color="#2D7BD4", width=150,
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            btn_frame, text="🗑 Clear All",
+            command=clear_filters, fg_color="#C0392B", width=130,
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            btn_frame, text="Cancel",
+            command=dialog.destroy, fg_color=("gray70", "gray30"), width=100,
+        ).pack(side="left")
+
+    def _filter_indicator_text(self) -> str:
+        """Return a short status string for the filter indicator label."""
+        count = len(self.download_file_filters)
+        return f"⚡ {count} active filter(s) applied" if count else ""
+
+    def _update_filter_button(self):
+        """
+        Update the Filter button's label and colour to reflect whether
+        any filters are currently active.
+        """
+        count = len(self.download_file_filters)
+        if count > 0:
+            self.download_filter_button.configure(
+                text=f"🔍 Filter ({count})",
+                fg_color="#E67E22",       # orange = filters active
+                hover_color="#CA6F1E",
+            )
+        else:
+            self.download_filter_button.configure(
+                text="🔍 Filter",
+                fg_color="#555E6B",       # default muted grey-blue
+                hover_color="#3A4250",
+            )    
 
     def download_files_action(self):
         """Handle download files button click"""
@@ -2294,7 +2504,8 @@ class SalesforceExporterGUI(ctk.CTk):
         def do_export():
             try:
                 output_path, stats = self.content_document_exporter.export_content_documents(
-                    output_file_path
+                    output_file_path,
+                    filters=self.download_file_filters or None,
                 )
 
                 end_time = time.time()
