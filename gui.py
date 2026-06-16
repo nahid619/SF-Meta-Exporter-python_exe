@@ -2293,7 +2293,7 @@ class SalesforceExporterGUI(ctk.CTk):
         """Open the filter configuration modal for Download Files."""
         dialog = ctk.CTkToplevel(self)
         dialog.title("Download Files — Filters")
-        dialog.geometry("500x720")
+        dialog.geometry("500x780")
         dialog.resizable(False, False)
         dialog.grab_set()
         dialog.lift()
@@ -2373,6 +2373,19 @@ class SalesforceExporterGUI(ctk.CTk):
             width=120,
         ).pack(side="left", padx=(6, 0))
 
+        # ── Is Latest Version ─────────────────────────────────────────────────
+        section("Version Filter")
+        latest_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        latest_frame.pack(fill="x", padx=24, pady=3)
+        ctk.CTkLabel(latest_frame, text="Is Latest Version", width=160, anchor="w").pack(side="left")
+        latest_var = ctk.StringVar(value=f.get("is_latest", "Any"))
+        ctk.CTkOptionMenu(
+            latest_frame,
+            values=["Any", "True", "False"],
+            variable=latest_var,
+            width=120,
+        ).pack(side="left", padx=(6, 0))
+
         # ── Linked Object Filter ─────────────────────────────────────────────
         # Salesforce Files don't carry a Parent/Type field like legacy
         # Attachments, so this reuses the same Available Objects selection
@@ -2447,6 +2460,7 @@ class SalesforceExporterGUI(ctk.CTk):
                 "file_extension": file_ext_entry.get().strip(),
                 "title":          title_entry.get().strip(),
                 "is_archived":    archived_var.get(),
+                "is_latest":      latest_var.get(),
             }
             # Drop empty / "Any" values — cleaner dict, easier SOQL building
             self.download_file_filters = {

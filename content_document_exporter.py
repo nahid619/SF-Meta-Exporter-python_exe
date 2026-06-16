@@ -121,7 +121,7 @@ class ContentDocumentExporter:
 
             self._log_status(f"\n[{doc_index}/{len(content_documents)}] Processing: {title}")
 
-            versions = self._query_all_versions(doc_id)
+            versions = self._query_all_versions(doc_id, filters)
 
             if not versions:
                 self._log_status(f"  ⚠️ No versions found for {title}")
@@ -374,22 +374,38 @@ class ContentDocumentExporter:
         for i in range(0, len(items), size):
             yield items[i:i + size]
 
-    def _query_all_versions(self, document_id: str) -> List[Dict]:
+    def _query_all_versions(
+        self,
+        document_id: str,
+        filters: Optional[Dict] = None,
+    ) -> List[Dict]:
         """
-        Query all versions for a specific ContentDocument.
+        Query versions for a specific ContentDocument.
+
+        When filters contains 'is_latest' = 'True', only the current/latest
+        version is fetched (AND IsLatest = true).  'False' fetches only
+        non-latest (historical) versions.  Anything else fetches all versions.
 
         Args:
             document_id: ContentDocument Id
+            filters:     optional filter dict from the GUI modal
 
         Returns:
             List of ContentVersion records with version info
         """
         try:
+            is_latest_filter = (filters or {}).get("is_latest", "")
+            is_latest_clause = ""
+            if is_latest_filter == "True":
+                is_latest_clause = " AND IsLatest = true"
+            elif is_latest_filter == "False":
+                is_latest_clause = " AND IsLatest = false"
+
             query = f"""
                 SELECT Id, ContentDocumentId, VersionNumber, IsLatest,
                     ContentSize, CreatedDate, LastModifiedDate
                 FROM ContentVersion
-                WHERE ContentDocumentId = '{document_id}'
+                WHERE ContentDocumentId = '{document_id}'{is_latest_clause}
                 ORDER BY VersionNumber ASC
             """
 
