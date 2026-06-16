@@ -138,6 +138,10 @@ class SalesforceExporterGUI(ctk.CTk):
         # Keys: created_from, created_to, modified_from, modified_to,
         #       file_type, file_extension, title, is_archived
         self.download_file_filters: dict = {}
+        # When True, Download Files is also restricted to files linked to
+        # whatever objects are checked in the Available Objects panel
+        # (resolved via ContentDocumentLink — see ContentDocumentExporter).
+        self.download_filter_by_objects: bool = False
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
@@ -2289,7 +2293,7 @@ class SalesforceExporterGUI(ctk.CTk):
         """Open the filter configuration modal for Download Files."""
         dialog = ctk.CTkToplevel(self)
         dialog.title("Download Files — Filters")
-        dialog.geometry("500x620")
+        dialog.geometry("500x720")
         dialog.resizable(False, False)
         dialog.grab_set()
         dialog.lift()
@@ -2369,6 +2373,34 @@ class SalesforceExporterGUI(ctk.CTk):
             width=120,
         ).pack(side="left", padx=(6, 0))
 
+        # ── Linked Object Filter ─────────────────────────────────────────────
+        # Salesforce Files don't carry a Parent/Type field like legacy
+        # Attachments, so this reuses the same Available Objects selection
+        # already shared by Picklist/Metadata/Attachment exports, resolved
+        # via ContentDocumentLink at download time.
+        section("Linked Object Filter")
+
+        obj_filter_var = ctk.BooleanVar(value=self.download_filter_by_objects)
+        ctk.CTkCheckBox(
+            dialog,
+            text="Restrict to objects selected in the Available Objects panel",
+            variable=obj_filter_var,
+        ).pack(padx=24, pady=(2, 2), anchor="w")
+
+        def _selected_objects_preview() -> str:
+            if self.selected_objects:
+                return "Currently selected: " + ", ".join(sorted(self.selected_objects))
+            return "No objects are currently selected in the Available Objects panel"
+
+        ctk.CTkLabel(
+            dialog,
+            text=_selected_objects_preview(),
+            font=ctk.CTkFont(size=11),
+            text_color=("gray40", "gray60"),
+            wraplength=450,
+            justify="left",
+        ).pack(padx=24, pady=(0, 4), anchor="w")
+
         # ── Active filter count indicator ─────────────────────────────────────
         indicator_var = ctk.StringVar(value=self._filter_indicator_text())
         ctk.CTkLabel(
@@ -2420,12 +2452,14 @@ class SalesforceExporterGUI(ctk.CTk):
             self.download_file_filters = {
                 k: v for k, v in raw.items() if v and v != "Any"
             }
+            self.download_filter_by_objects = obj_filter_var.get()
             self._update_filter_button()
             dialog.destroy()
 
         # ── Clear ─────────────────────────────────────────────────────────────
         def clear_filters():
             self.download_file_filters = {}
+            self.download_filter_by_objects = False
             self._update_filter_button()
             dialog.destroy()
 
@@ -2450,7 +2484,7 @@ class SalesforceExporterGUI(ctk.CTk):
 
     def _filter_indicator_text(self) -> str:
         """Return a short status string for the filter indicator label."""
-        count = len(self.download_file_filters)
+        count = len(self.download_file_filters) + (1 if self.download_filter_by_objects else 0)
         return f"⚡ {count} active filter(s) applied" if count else ""
 
     def _update_filter_button(self):
@@ -2458,7 +2492,7 @@ class SalesforceExporterGUI(ctk.CTk):
         Update the Filter button's label and colour to reflect whether
         any filters are currently active.
         """
-        count = len(self.download_file_filters)
+        count = len(self.download_file_filters) + (1 if self.download_filter_by_objects else 0)
         if count > 0:
             self.download_filter_button.configure(
                 text=f"🔍 Filter ({count})",
@@ -2476,6 +2510,16 @@ class SalesforceExporterGUI(ctk.CTk):
         """Handle download files button click"""
         if not self.sf_client or not self.content_document_exporter:
             messagebox.showerror("Error", "Not logged in. Please log in first.")
+            return
+
+        # ✅ NEW: If the object filter is on, make sure something is actually selected
+        if self.download_filter_by_objects and not self.selected_objects:
+            messagebox.showwarning(
+                "No Objects Selected",
+                "The 'Restrict to selected objects' option is enabled in \U0001F50D Filter,\n"
+                "but no objects are selected in the Available Objects panel.\n\n"
+                "Select at least one object, or turn that option off in the filter."
+            )
             return
 
         # ✅ NEW: Check if another operation is running
@@ -2496,6 +2540,9 @@ class SalesforceExporterGUI(ctk.CTk):
             self.button_manager.end_operation()
             return
 
+        # ✅ NEW: Resolve the object-type restriction (live read — reflects
+        # whatever is checked in the Available Objects panel right now)
+        object_types = sorted(self.selected_objects) if self.download_filter_by_objects else None
 
         self.update_status("Starting ContentDocument export and file downloads...")
         start_time = time.time()
@@ -2506,6 +2553,7 @@ class SalesforceExporterGUI(ctk.CTk):
                 output_path, stats = self.content_document_exporter.export_content_documents(
                     output_file_path,
                     filters=self.download_file_filters or None,
+                    object_types=object_types,
                 )
 
                 end_time = time.time()
@@ -2532,9 +2580,16 @@ class SalesforceExporterGUI(ctk.CTk):
         csv_dir = os.path.dirname(output_path)
         documents_folder = os.path.join(csv_dir, "Documents")
 
+        # ✅ NEW: Note which object types scoped this run, if any
+        object_filter_line = ""
+        filtered_objects = stats.get('object_types_filtered') or []
+        if filtered_objects:
+            object_filter_line = f"Object Filter: {', '.join(filtered_objects)}\n"
+
         # Build success message
         message = (
             f"ContentDocument export completed!\n\n"
+            f"{object_filter_line}"
             f"Documents Found: {stats['total_documents']}\n"
             f"Total Versions: {stats['total_versions']}\n"
             f"Successfully Downloaded: {stats['successful_downloads']}\n"

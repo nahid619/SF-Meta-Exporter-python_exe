@@ -5,7 +5,7 @@ import os
 import re
 import csv
 import requests
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 from salesforce_client import SalesforceClient
 
 
@@ -19,6 +19,11 @@ class ContentDocumentExporter:
         self.base_url = sf_client.base_url
         self.headers = sf_client.headers
 
+    # Max ContentDocument Ids per "Id IN (...)" SOQL clause. Keeps the query
+    # string comfortably under Salesforce's 20,000-character SOQL limit, even
+    # combined with the other field filters (date ranges, LIKE clauses, etc.).
+    _ID_CHUNK_SIZE = 400
+
     # ──────────────────────────────────────────────────────────────────────────
     # Public API
     # ──────────────────────────────────────────────────────────────────────────
@@ -27,22 +32,30 @@ class ContentDocumentExporter:
         self,
         output_path: str,
         filters: Optional[Dict] = None,
+        object_types: Optional[List[str]] = None,
     ) -> Tuple[str, Dict]:
         """
         Export ContentDocument metadata to CSV and download all file versions.
 
         Args:
-            output_path: Path for the CSV file.
-            filters:     Optional dict produced by the filter modal in gui.py.
-                         Supported keys (all optional):
-                           created_from   – YYYY-MM-DD  (inclusive lower bound)
-                           created_to     – YYYY-MM-DD  (inclusive upper bound)
-                           modified_from  – YYYY-MM-DD
-                           modified_to    – YYYY-MM-DD
-                           file_type      – partial string  (LIKE '%…%')
-                           file_extension – partial string  (LIKE '%…%')
-                           title          – partial string  (LIKE '%…%')
-                           is_archived    – 'True' | 'False'  (omit key or set '' for "Any")
+            output_path:  Path for the CSV file.
+            filters:      Optional dict produced by the filter modal in gui.py.
+                          Supported keys (all optional):
+                            created_from   – YYYY-MM-DD  (inclusive lower bound)
+                            created_to     – YYYY-MM-DD  (inclusive upper bound)
+                            modified_from  – YYYY-MM-DD
+                            modified_to    – YYYY-MM-DD
+                            file_type      – partial string  (LIKE '%…%')
+                            file_extension – partial string  (LIKE '%…%')
+                            title          – partial string  (LIKE '%…%')
+                            is_archived    – 'True' | 'False'  (omit key or set '' for "Any")
+            object_types: Optional list of object API names (e.g. ['Account', 'Case']).
+                          When provided, only files linked to a record of one of
+                          these object types are downloaded — mirrors the
+                          "filter by parent object" behaviour already used for
+                          legacy Attachments, but implemented via
+                          ContentDocumentLink since ContentDocument has no
+                          direct Parent/Type field.
 
         Returns:
             Tuple of (csv_path, statistics_dict)
@@ -59,6 +72,7 @@ class ContentDocumentExporter:
             'failed_downloads': 0,
             'total_size_bytes': 0,
             'failed_files': [],
+            'object_types_filtered': [],
         }
 
         # Create Documents folder in same directory as CSV
@@ -69,15 +83,32 @@ class ContentDocumentExporter:
             os.makedirs(documents_folder)
             self._log_status(f"Created folder: {documents_folder}")
 
-        # Query ContentDocuments (with optional filters)
+        # ── Resolve object-type restriction ──────────────────────────────────
+        # ContentDocument has no Parent/Type field like legacy Attachment does,
+        # so "filter by object" has to go through the ContentDocumentLink
+        # bridge object instead (see _query_linked_document_ids).
+        restrict_to_ids: Optional[Set[str]] = None
+        if object_types:
+            self._log_status(f"Filtering by linked object type(s): {', '.join(object_types)}")
+            restrict_to_ids = set()
+            for obj_type in object_types:
+                linked_ids = self._query_linked_document_ids(obj_type)
+                self._log_status(f"  {obj_type}: {len(linked_ids)} linked document(s)")
+                restrict_to_ids |= linked_ids
+            stats['object_types_filtered'] = object_types
+
+        # Query ContentDocuments (with optional field filters + object restriction)
         self._log_status("Querying ContentDocument records...")
-        content_documents = self._query_content_documents(filters)
+        content_documents = self._query_content_documents(filters, restrict_to_ids)
         stats['total_documents'] = len(content_documents)
 
         self._log_status(f"Found {len(content_documents)} ContentDocument records")
 
         if len(content_documents) == 0:
-            self._log_status("No ContentDocument records found in org")
+            if restrict_to_ids is not None and len(restrict_to_ids) == 0:
+                self._log_status("No documents are linked to the selected object type(s)")
+            else:
+                self._log_status("No ContentDocument records found in org")
             self._create_csv_file([], output_path)
             return output_path, stats
 
@@ -250,30 +281,98 @@ class ContentDocumentExporter:
     # Salesforce query methods
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _query_content_documents(self, filters: Optional[Dict] = None) -> List[Dict]:
-        """Query ContentDocument records, optionally filtered."""
+    def _query_linked_document_ids(self, object_type: str) -> Set[str]:
+        """
+        Return the ContentDocumentIds linked to any record of `object_type`.
+
+        Salesforce Files don't carry a Parent/Type field the way legacy
+        Attachments do — the link lives on ContentDocumentLink.LinkedEntityId,
+        a polymorphic field that can't be filtered by LinkedEntity.Type
+        directly. The standard workaround is a semi-join scoping
+        LinkedEntityId to the target object's own Id space:
+
+            SELECT ContentDocumentId FROM ContentDocumentLink
+            WHERE LinkedEntityId IN (SELECT Id FROM {object_type})
+        """
         try:
-            where_clause = self._build_where_clause(filters)
-
-            query = f"""
-                SELECT Id, Title, FileExtension, FileType, ContentSize,
-                       CreatedDate, CreatedById, LastModifiedDate, LastModifiedById,
-                       OwnerId, ParentId, IsArchived, IsDeleted,
-                       ArchivedDate, ArchivedById, Description,
-                       PublishStatus, LatestPublishedVersionId
-                FROM ContentDocument
-                {where_clause}
-                ORDER BY CreatedDate DESC
-            """
-
-            self._log_status(f"SOQL: {' '.join(query.split())}")  # compact log
+            query = (
+                "SELECT ContentDocumentId "
+                "FROM ContentDocumentLink "
+                f"WHERE LinkedEntityId IN (SELECT Id FROM {object_type})"
+            )
+            self._log_status(f"SOQL: {' '.join(query.split())}")
 
             result = self.sf.query_all(query)
-            return result['records']
+            return {r['ContentDocumentId'] for r in result['records']}
+
+        except Exception as e:
+            self._log_status(f"  ⚠️ Error querying ContentDocumentLink for {object_type}: {str(e)}")
+            return set()
+
+    def _query_content_documents(
+        self,
+        filters: Optional[Dict] = None,
+        restrict_to_ids: Optional[Set[str]] = None,
+    ) -> List[Dict]:
+        """
+        Query ContentDocument records, optionally filtered and/or restricted
+        to a specific set of Ids (the linked-object filter resolves to this).
+        """
+        if restrict_to_ids is not None and len(restrict_to_ids) == 0:
+            return []
+
+        try:
+            base_where = self._build_where_clause(filters)
+
+            if not restrict_to_ids:
+                query = self._build_content_document_query(base_where)
+                self._log_status(f"SOQL: {' '.join(query.split())}")  # compact log
+                result = self.sf.query_all(query)
+                return result['records']
+
+            # Batch the Id list so each "Id IN (...)" clause stays well under
+            # Salesforce's SOQL length limit, then merge the batched results.
+            all_records: List[Dict] = []
+            for batch in self._chunk(sorted(restrict_to_ids), self._ID_CHUNK_SIZE):
+                id_clause = "Id IN (" + ",".join(f"'{doc_id}'" for doc_id in batch) + ")"
+                where_clause = self._combine_where(base_where, id_clause)
+                query = self._build_content_document_query(where_clause)
+                self._log_status(f"SOQL: {' '.join(query.split())}")  # compact log
+                result = self.sf.query_all(query)
+                all_records.extend(result['records'])
+
+            return all_records
 
         except Exception as e:
             self._log_status(f"ERROR querying ContentDocument: {str(e)}")
             raise
+
+    @staticmethod
+    def _build_content_document_query(where_clause: str) -> str:
+        """Build the ContentDocument SELECT statement for a given WHERE clause."""
+        return f"""
+            SELECT Id, Title, FileExtension, FileType, ContentSize,
+                   CreatedDate, CreatedById, LastModifiedDate, LastModifiedById,
+                   OwnerId, ParentId, IsArchived, IsDeleted,
+                   ArchivedDate, ArchivedById, Description,
+                   PublishStatus, LatestPublishedVersionId
+            FROM ContentDocument
+            {where_clause}
+            ORDER BY CreatedDate DESC
+        """
+
+    @staticmethod
+    def _combine_where(base_where: str, extra_condition: str) -> str:
+        """Combine an existing 'WHERE ...' clause (or '') with one more bare condition."""
+        if base_where:
+            return f"{base_where} AND {extra_condition}"
+        return f"WHERE {extra_condition}"
+
+    @staticmethod
+    def _chunk(items: List, size: int):
+        """Yield successive `size`-length slices of `items`."""
+        for i in range(0, len(items), size):
+            yield items[i:i + size]
 
     def _query_all_versions(self, document_id: str) -> List[Dict]:
         """
