@@ -17,6 +17,7 @@ from oauth_handler import OAuthWebFlow
 from picklist_exporter import PicklistExporter
 from metadata_exporter import MetadataExporter
 from content_document_exporter import ContentDocumentExporter
+from content_document_link_exporter import ContentDocumentLinkExporter
 from attachment_exporter import AttachmentExporter
 from utils import format_runtime, print_picklist_statistics, print_metadata_statistics, print_content_document_statistics
 
@@ -127,6 +128,7 @@ class SalesforceExporterGUI(ctk.CTk):
         self.picklist_exporter: Optional[PicklistExporter] = None
         self.metadata_exporter: Optional[MetadataExporter] = None
         self.content_document_exporter: Optional[ContentDocumentExporter] = None
+        self.content_document_link_exporter: Optional[ContentDocumentLinkExporter] = None
         self.attachment_exporter: Optional[AttachmentExporter] = None
         self.all_org_objects: List[str] = []
         self.selected_objects: Set[str] = set()
@@ -138,10 +140,6 @@ class SalesforceExporterGUI(ctk.CTk):
         # Keys: created_from, created_to, modified_from, modified_to,
         #       file_type, file_extension, title, is_archived
         self.download_file_filters: dict = {}
-        # When True, Download Files is also restricted to files linked to
-        # whatever objects are checked in the Available Objects panel
-        # (resolved via ContentDocumentLink — see ContentDocumentExporter).
-        self.download_filter_by_objects: bool = False
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
@@ -875,12 +873,14 @@ class SalesforceExporterGUI(ctk.CTk):
         try:
             self.update_status("🔧 Initializing ContentDocument Exporter...")
             self.content_document_exporter = ContentDocumentExporter(self.sf_client)
+            self.content_document_link_exporter = ContentDocumentLinkExporter(self.sf_client)
             self.update_status("✅ ContentDocument Exporter initialized")
         except Exception as e:
             self.update_status(f"❌ ERROR initializing ContentDocument Exporter: {str(e)}")
             import traceback
             self.update_status(f"🔍 Stack trace:\n{traceback.format_exc()}")
             self.content_document_exporter = None
+            self.content_document_link_exporter = None
         
         try:
             self.update_status("🔧 Initializing Attachment Exporter...")
@@ -2293,7 +2293,7 @@ class SalesforceExporterGUI(ctk.CTk):
         """Open the filter configuration modal for Download Files."""
         dialog = ctk.CTkToplevel(self)
         dialog.title("Download Files — Filters")
-        dialog.geometry("500x780")
+        dialog.geometry("500x720")
         dialog.resizable(False, False)
         dialog.grab_set()
         dialog.lift()
@@ -2372,47 +2372,25 @@ class SalesforceExporterGUI(ctk.CTk):
             variable=archived_var,
             width=120,
         ).pack(side="left", padx=(6, 0))
-
+        
         # ── Is Latest Version ─────────────────────────────────────────────────
         section("Version Filter")
         latest_frame = ctk.CTkFrame(dialog, fg_color="transparent")
         latest_frame.pack(fill="x", padx=24, pady=3)
         ctk.CTkLabel(latest_frame, text="Is Latest Version", width=160, anchor="w").pack(side="left")
-        latest_var = ctk.StringVar(value=f.get("is_latest", "Any"))
+        latest_var = ctk.StringVar(value=f.get("is_latest_version", "Any"))
         ctk.CTkOptionMenu(
             latest_frame,
-            values=["Any", "True", "False"],
+            values=["Any", "True"],
             variable=latest_var,
             width=120,
         ).pack(side="left", padx=(6, 0))
-
-        # ── Linked Object Filter ─────────────────────────────────────────────
-        # Salesforce Files don't carry a Parent/Type field like legacy
-        # Attachments, so this reuses the same Available Objects selection
-        # already shared by Picklist/Metadata/Attachment exports, resolved
-        # via ContentDocumentLink at download time.
-        section("Linked Object Filter")
-
-        obj_filter_var = ctk.BooleanVar(value=self.download_filter_by_objects)
-        ctk.CTkCheckBox(
-            dialog,
-            text="Restrict to objects selected in the Available Objects panel",
-            variable=obj_filter_var,
-        ).pack(padx=24, pady=(2, 2), anchor="w")
-
-        def _selected_objects_preview() -> str:
-            if self.selected_objects:
-                return "Currently selected: " + ", ".join(sorted(self.selected_objects))
-            return "No objects are currently selected in the Available Objects panel"
-
         ctk.CTkLabel(
-            dialog,
-            text=_selected_objects_preview(),
+            latest_frame,
+            text="  (True = skip older versions)",
             font=ctk.CTkFont(size=11),
             text_color=("gray40", "gray60"),
-            wraplength=450,
-            justify="left",
-        ).pack(padx=24, pady=(0, 4), anchor="w")
+        ).pack(side="left")
 
         # ── Active filter count indicator ─────────────────────────────────────
         indicator_var = ctk.StringVar(value=self._filter_indicator_text())
@@ -2460,20 +2438,18 @@ class SalesforceExporterGUI(ctk.CTk):
                 "file_extension": file_ext_entry.get().strip(),
                 "title":          title_entry.get().strip(),
                 "is_archived":    archived_var.get(),
-                "is_latest":      latest_var.get(),
+                "is_latest_version": latest_var.get(),
             }
             # Drop empty / "Any" values — cleaner dict, easier SOQL building
             self.download_file_filters = {
                 k: v for k, v in raw.items() if v and v != "Any"
             }
-            self.download_filter_by_objects = obj_filter_var.get()
             self._update_filter_button()
             dialog.destroy()
 
         # ── Clear ─────────────────────────────────────────────────────────────
         def clear_filters():
             self.download_file_filters = {}
-            self.download_filter_by_objects = False
             self._update_filter_button()
             dialog.destroy()
 
@@ -2498,7 +2474,7 @@ class SalesforceExporterGUI(ctk.CTk):
 
     def _filter_indicator_text(self) -> str:
         """Return a short status string for the filter indicator label."""
-        count = len(self.download_file_filters) + (1 if self.download_filter_by_objects else 0)
+        count = len(self.download_file_filters)
         return f"⚡ {count} active filter(s) applied" if count else ""
 
     def _update_filter_button(self):
@@ -2506,7 +2482,7 @@ class SalesforceExporterGUI(ctk.CTk):
         Update the Filter button's label and colour to reflect whether
         any filters are currently active.
         """
-        count = len(self.download_file_filters) + (1 if self.download_filter_by_objects else 0)
+        count = len(self.download_file_filters)
         if count > 0:
             self.download_filter_button.configure(
                 text=f"🔍 Filter ({count})",
@@ -2521,25 +2497,40 @@ class SalesforceExporterGUI(ctk.CTk):
             )    
 
     def download_files_action(self):
-        """Handle download files button click"""
+        """Handle download files button click.
+
+        Behaviour:
+          - 0 objects selected  → full ContentDocument export (existing behaviour)
+          - 1 object selected   → object-linked export via ContentDocumentLinkExporter
+          - 2+ objects selected → warn user; ask whether to proceed with full export
+        """
         if not self.sf_client or not self.content_document_exporter:
             messagebox.showerror("Error", "Not logged in. Please log in first.")
             return
 
-        # ✅ NEW: If the object filter is on, make sure something is actually selected
-        if self.download_filter_by_objects and not self.selected_objects:
-            messagebox.showwarning(
-                "No Objects Selected",
-                "The 'Restrict to selected objects' option is enabled in \U0001F50D Filter,\n"
-                "but no objects are selected in the Available Objects panel.\n\n"
-                "Select at least one object, or turn that option off in the filter."
-            )
-            return
+        # ── Determine export mode based on object selection ───────────────────
+        selected = list(self.selected_objects)
 
-        # ✅ NEW: Check if another operation is running
+        if len(selected) > 1:
+            proceed = messagebox.askyesno(
+                "Multiple Objects Selected",
+                f"{len(selected)} objects are currently selected.\n\n"
+                "Object-linked file download supports one object at a time.\n\n"
+                "Do you want to proceed with a full download instead "
+                "(no object filter applied)?",
+            )
+            if not proceed:
+                return
+            selected = []   # fall through to full export
+
+        use_object_filter = len(selected) == 1
+        object_type       = selected[0] if use_object_filter else None
+
+        # ── Guard: operation already running? ────────────────────────────────
         if not self.button_manager.start_operation("File Download"):
             return
 
+        # ── File save dialog ─────────────────────────────────────────────────
         default_filename = DEFAULT_CONTENTDOCUMENT_FILENAME.format(
             timestamp=datetime.now().strftime("%Y%m%d_%H%M%S")
         )
@@ -2550,40 +2541,55 @@ class SalesforceExporterGUI(ctk.CTk):
         )
 
         if not output_file_path:
-            # ✅ NEW: User cancelled, end operation
             self.button_manager.end_operation()
             return
 
-        # ✅ NEW: Resolve the object-type restriction (live read — reflects
-        # whatever is checked in the Available Objects panel right now)
-        object_types = sorted(self.selected_objects) if self.download_filter_by_objects else None
+        # ── Kick off background export ────────────────────────────────────────
+        if use_object_filter:
+            self.update_status(
+                f"Starting ContentDocument export for {object_type}..."
+            )
+        else:
+            self.update_status(
+                "Starting ContentDocument export and file downloads..."
+            )
 
-        self.update_status("Starting ContentDocument export and file downloads...")
         start_time = time.time()
 
-        # Run export in background thread
         def do_export():
             try:
-                output_path, stats = self.content_document_exporter.export_content_documents(
-                    output_file_path,
-                    filters=self.download_file_filters or None,
-                    object_types=object_types,
-                )
+                active_filters = self.download_file_filters or None
 
-                end_time = time.time()
-                runtime_seconds = end_time - start_time
+                if use_object_filter:
+                    output_path, stats = (
+                        self.content_document_link_exporter
+                        .export_content_documents_for_object(
+                            output_file_path,
+                            object_type=object_type,
+                            filters=active_filters,
+                        )
+                    )
+                else:
+                    output_path, stats = (
+                        self.content_document_exporter
+                        .export_content_documents(
+                            output_file_path,
+                            filters=active_filters,
+                        )
+                    )
+
+                end_time          = time.time()
+                runtime_seconds   = end_time - start_time
                 runtime_formatted = format_runtime(runtime_seconds)
 
-                # Update UI on main thread
                 self.after(0, lambda: self._on_download_files_success(
                     output_path, stats, runtime_formatted
                 ))
 
             except Exception as e:
-                # Handle error on main thread
                 self.after(0, lambda: self._on_download_files_error(str(e)))
 
-        ThreadHelper.run_in_thread(do_export)
+        ThreadHelper.run_in_thread(do_export)        
 
 
     def _on_download_files_success(self, output_path, stats, runtime_formatted):
@@ -2594,22 +2600,20 @@ class SalesforceExporterGUI(ctk.CTk):
         csv_dir = os.path.dirname(output_path)
         documents_folder = os.path.join(csv_dir, "Documents")
 
-        # ✅ NEW: Note which object types scoped this run, if any
-        object_filter_line = ""
-        filtered_objects = stats.get('object_types_filtered') or []
-        if filtered_objects:
-            object_filter_line = f"Object Filter: {', '.join(filtered_objects)}\n"
-
         # Build success message
+        failed_line = ""
+        if stats.get('failed_csv_path'):
+            failed_line = f"⚠️ Failed Records CSV: {stats['failed_csv_path']}\n"
+            
         message = (
             f"ContentDocument export completed!\n\n"
-            f"{object_filter_line}"
             f"Documents Found: {stats['total_documents']}\n"
             f"Total Versions: {stats['total_versions']}\n"
             f"Successfully Downloaded: {stats['successful_downloads']}\n"
             f"Failed: {stats['failed_downloads']}\n\n"
             f"CSV File: {output_path}\n"
             f"Files Folder: {documents_folder}\n\n"
+            f"{failed_line}"
             f"💡 CSV is DataLoader-ready for migration!"
         )
 
@@ -2809,6 +2813,7 @@ class SalesforceExporterGUI(ctk.CTk):
             self.picklist_exporter = None
             self.metadata_exporter = None
             self.content_document_exporter = None
+            self.content_document_link_exporter = None
             self.attachment_exporter = None
             self.selected_objects.clear()
             self.all_org_objects.clear()

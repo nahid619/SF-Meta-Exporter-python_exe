@@ -4,10 +4,8 @@ ContentDocument export functionality - exports metadata and downloads files
 import os
 import re
 import csv
-import threading
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Tuple, Optional, Set
+from typing import List, Dict, Tuple, Optional
 from salesforce_client import SalesforceClient
 
 
@@ -21,21 +19,6 @@ class ContentDocumentExporter:
         self.base_url = sf_client.base_url
         self.headers = sf_client.headers
 
-    # Max ContentDocument Ids per "Id IN (...)" SOQL clause. Keeps the query
-    # string comfortably under Salesforce's 20,000-character SOQL limit, even
-    # combined with the other field filters (date ranges, LIKE clauses, etc.).
-    _ID_CHUNK_SIZE  = 400   # max Ids per SOQL IN clause
-    _DEFAULT_WORKERS = 5    # concurrent download threads
-
-    # Shared CSV column order used by both incremental writer and _create_csv_file
-    _CSV_HEADERS = [
-        'Title', 'PathOnClient',
-        'ContentDocumentId', 'FirstPublishLocationId', 'Description', 'Origin',
-        'VersionNumber', 'IsLatestVersion', 'Total_Versions_Available',
-        'FileExtension', 'FileType', 'ContentSize (Bytes)',
-        'CreatedDate', 'LastModifiedDate', 'OwnerId',
-    ]
-
     # ──────────────────────────────────────────────────────────────────────────
     # Public API
     # ──────────────────────────────────────────────────────────────────────────
@@ -44,31 +27,23 @@ class ContentDocumentExporter:
         self,
         output_path: str,
         filters: Optional[Dict] = None,
-        object_types: Optional[List[str]] = None,
-        max_workers: int = None,
     ) -> Tuple[str, Dict]:
         """
-        Export ContentDocument metadata to CSV and download all file versions.
+        Export ContentDocument metadata to CSV and download file versions.
 
         Args:
-            output_path:  Path for the CSV file.
-            filters:      Optional dict produced by the filter modal in gui.py.
-                          Supported keys (all optional):
-                            created_from   – YYYY-MM-DD  (inclusive lower bound)
-                            created_to     – YYYY-MM-DD  (inclusive upper bound)
-                            modified_from  – YYYY-MM-DD
-                            modified_to    – YYYY-MM-DD
-                            file_type      – partial string  (LIKE '%…%')
-                            file_extension – partial string  (LIKE '%…%')
-                            title          – partial string  (LIKE '%…%')
-                            is_archived    – 'True' | 'False'  (omit key or set '' for "Any")
-            object_types: Optional list of object API names (e.g. ['Account', 'Case']).
-                          When provided, only files linked to a record of one of
-                          these object types are downloaded — mirrors the
-                          "filter by parent object" behaviour already used for
-                          legacy Attachments, but implemented via
-                          ContentDocumentLink since ContentDocument has no
-                          direct Parent/Type field.
+            output_path: Path for the CSV file.
+            filters:     Optional dict produced by the filter modal in gui.py.
+                         Supported keys (all optional):
+                           created_from      – YYYY-MM-DD  (inclusive lower bound on ContentDocument)
+                           created_to        – YYYY-MM-DD  (inclusive upper bound on ContentDocument)
+                           modified_from     – YYYY-MM-DD
+                           modified_to       – YYYY-MM-DD
+                           file_type         – partial string  (LIKE '%…%')
+                           file_extension    – partial string  (LIKE '%…%')
+                           title             – partial string  (LIKE '%…%')
+                           is_archived       – 'True' | 'False'
+                           is_latest_version – 'True' | 'False'  ← ContentVersion level filter
 
         Returns:
             Tuple of (csv_path, statistics_dict)
@@ -85,7 +60,6 @@ class ContentDocumentExporter:
             'failed_downloads': 0,
             'total_size_bytes': 0,
             'failed_files': [],
-            'object_types_filtered': [],
         }
 
         # Create Documents folder in same directory as CSV
@@ -96,145 +70,112 @@ class ContentDocumentExporter:
             os.makedirs(documents_folder)
             self._log_status(f"Created folder: {documents_folder}")
 
-        # ── Resolve object-type restriction ──────────────────────────────────
-        # ContentDocument has no Parent/Type field like legacy Attachment does,
-        # so "filter by object" has to go through the ContentDocumentLink
-        # bridge object instead (see _query_linked_document_ids).
-        restrict_to_ids: Optional[Set[str]] = None
-        if object_types:
-            self._log_status(f"Filtering by linked object type(s): {', '.join(object_types)}")
-            restrict_to_ids = set()
-            for obj_type in object_types:
-                linked_ids = self._query_linked_document_ids(obj_type)
-                self._log_status(f"  {obj_type}: {len(linked_ids)} linked document(s)")
-                restrict_to_ids |= linked_ids
-            stats['object_types_filtered'] = object_types
-
-        # Query ContentDocuments (with optional field filters + object restriction)
+        # Query ContentDocuments (with optional ContentDocument-level filters)
         self._log_status("Querying ContentDocument records...")
-        content_documents = self._query_content_documents(filters, restrict_to_ids)
+        content_documents = self._query_content_documents(filters)
         stats['total_documents'] = len(content_documents)
 
         self._log_status(f"Found {len(content_documents)} ContentDocument records")
 
         if len(content_documents) == 0:
-            if restrict_to_ids is not None and len(restrict_to_ids) == 0:
-                self._log_status("No documents are linked to the selected object type(s)")
-            else:
-                self._log_status("No ContentDocument records found in org")
+            self._log_status("No ContentDocument records found in org")
             self._create_csv_file([], output_path)
             return output_path, stats
 
-        # ── Phase 2: batch-query all versions in one go ──────────────────────
-        # Old approach: 1 SOQL per document (10,000 docs = 10,000 round trips).
-        # New approach: chunk all doc IDs → ~25 queries total.
-        doc_ids = [doc['Id'] for doc in content_documents]
-        n_batches = (len(doc_ids) + self._ID_CHUNK_SIZE - 1) // self._ID_CHUNK_SIZE
-        self._log_status(
-            f"\n=== Batch querying versions "
-            f"({len(doc_ids)} docs → {n_batches} SOQL queries) ==="
-        )
-        versions_map = self._query_versions_batch(doc_ids, filters)
+        # Extract ContentVersion-level filter once, before the loop
+        latest_only = (filters or {}).get("is_latest_version") == "True"
+        if latest_only:
+            self._log_status("Version filter: downloading latest version only")
 
-        # Build flat task list so the executor can pick any item next
-        download_tasks: List[Tuple[Dict, Dict, int]] = []
-        for doc in content_documents:
-            versions = versions_map.get(doc['Id'], [])
+        all_version_data = []
+
+        for doc_index, doc in enumerate(content_documents, 1):
+            doc_id = doc['Id']
+            title = doc['Title']
+            file_extension = doc.get('FileExtension', '')
+
+            self._log_status(f"\n[{doc_index}/{len(content_documents)}] Processing: {title}")
+
+            # Pass latest_only down — adds AND IsLatest = true to the query when set
+            versions = self._query_all_versions(doc_id, latest_only=latest_only)
+
             if not versions:
-                self._log_status(f"  ⚠️ No versions found for {doc.get('Title', doc['Id'])}")
+                self._log_status(f"  ⚠️ No versions found for {title}")
                 continue
+
             stats['total_versions'] += len(versions)
-            for version in versions:
-                download_tasks.append((doc, version, len(versions)))
+            total_versions_count = len(versions)
 
-        total_tasks = len(download_tasks)
-        workers = max_workers if max_workers is not None else self._DEFAULT_WORKERS
-        self._log_status(
-            f"\n=== Downloading {total_tasks} file version(s) "
-            f"(concurrent workers = {workers}) ==="
-        )
+            self._log_status(f"  Found {total_versions_count} version(s)")
 
-        # ── Phase 3: concurrent downloads + incremental CSV ───────────────────
-        # The CSV is opened immediately so every completed download is persisted
-        # to disk right away. If the run is interrupted partway through, the
-        # partial CSV already contains all rows that finished successfully.
-        io_lock = threading.Lock()   # guards both CSV writes and stats counters
-        completed_count = 0
+            for version_index, version in enumerate(versions, 1):
+                version_id = version['Id']
+                version_number = version['VersionNumber']
+                is_latest = version['IsLatest']
+                content_size = version.get('ContentSize', 0)
 
-        with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(self._CSV_HEADERS)
-            csvfile.flush()
+                self._log_status(
+                    f"  [{version_index}/{total_versions_count}] "
+                    f"Downloading version {version_number}..."
+                )
 
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                future_to_task = {
-                    executor.submit(
-                        self._download_file,
-                        doc['Id'],
-                        doc['Title'],
-                        doc.get('FileExtension', ''),
-                        version['Id'],
-                        version['VersionNumber'],
-                        documents_folder,
-                    ): (doc, version, total_v)
-                    for doc, version, total_v in download_tasks
-                }
+                try:
+                    file_path = self._download_file(
+                        document_id=doc_id,
+                        title=title,
+                        file_extension=file_extension,
+                        version_id=version_id,
+                        version_number=version_number,
+                        destination_folder=documents_folder,
+                    )
 
-                for future in as_completed(future_to_task):
-                    doc, version, total_v = future_to_task[future]
-                    completed_count += 1
+                    downloaded_filename = os.path.basename(file_path)
+                    path_on_client = f"Documents/{downloaded_filename}"
 
-                    try:
-                        file_path   = future.result()
-                        filename    = os.path.basename(file_path)
-                        path_on_client = f"Documents/{filename}"
-                        is_latest   = version['IsLatest']
-                        content_size = version.get('ContentSize', 0)
+                    stats['successful_downloads'] += 1
+                    stats['total_size_bytes'] += content_size
 
-                        row = self._build_csv_row(
-                            doc=doc,
-                            version=version,
-                            path_on_client=path_on_client,
-                            is_latest=is_latest,
-                            total_versions=total_v,
-                        )
+                    self._log_status(f"    ✅ Downloaded: {downloaded_filename}")
 
-                        with io_lock:
-                            stats['successful_downloads'] += 1
-                            stats['total_size_bytes']     += content_size
-                            writer.writerow(row)
-                            csvfile.flush()   # guarantee row hits disk now
+                    all_version_data.append({
+                        'document': doc,
+                        'version': version,
+                        'downloaded_filename': downloaded_filename,
+                        'path_on_client': path_on_client,
+                        'version_number': version_number,
+                        'is_latest': is_latest,
+                        'total_versions': total_versions_count,
+                    })
 
-                        self._log_status(
-                            f"  [{completed_count}/{total_tasks}] ✅ {filename}"
-                        )
+                except Exception as e:
+                    error_msg = str(e)
+                    self._log_status(f"    ❌ ERROR: {error_msg}")
+                    stats['failed_downloads'] += 1
 
-                    except Exception as e:
-                        ext      = doc.get('FileExtension', '')
-                        ver_num  = version.get('VersionNumber', '?')
-                        fallback = (
-                            f"{doc.get('Title', 'unknown')}_{doc['Id']}_v{ver_num}"
-                            + (f".{ext}" if ext else "")
-                        )
-                        self._log_status(
-                            f"  [{completed_count}/{total_tasks}] ❌ FAILED: {fallback} — {e}"
-                        )
-                        with io_lock:
-                            stats['failed_downloads'] += 1
-                            stats['failed_files'].append({
-                                'filename': fallback,
-                                'id':       doc['Id'],
-                                'version':  ver_num,
-                                'reason':   str(e),
-                            })
+                    if file_extension:
+                        filename = f"{title}_{doc_id}_v{version_number}.{file_extension}"
+                    else:
+                        filename = f"{title}_{doc_id}_v{version_number}"
 
-        self._log_status(f"\n✅ Incremental CSV saved: {output_path}")
-        self._log_status(
-            f"✅ {stats['successful_downloads']} downloaded, "
-            f"{stats['failed_downloads']} failed, "
-            f"out of {total_tasks} total"
-        )
-        return output_path, stats
+                    stats['failed_files'].append({
+                        'filename': filename,
+                        'id': doc_id,
+                        'version': version_number,
+                        'reason': error_msg,
+                    })
+
+        self._log_status("\n=== Creating CSV File ===")
+        final_output_path = self._create_csv_file(all_version_data, output_path)
+        
+        # Write failed records to a separate CSV alongside the main file
+        stats['failed_csv_path'] = ''
+        if stats['failed_files']:
+            failed_csv_path = self._create_failed_csv_file(
+                stats['failed_files'], output_path
+            )
+            stats['failed_csv_path'] = failed_csv_path
+
+        return final_output_path, stats
 
     # ──────────────────────────────────────────────────────────────────────────
     # Filter / SOQL helpers
@@ -242,12 +183,13 @@ class ContentDocumentExporter:
 
     def _build_where_clause(self, filters: Optional[Dict]) -> str:
         """
-        Convert the filter dict from the GUI modal into a SOQL WHERE clause.
+        Convert the filter dict from the GUI modal into a SOQL WHERE clause
+        for the ContentDocument object.
 
-        Date values arrive as 'YYYY-MM-DD' strings and are converted to the
-        Salesforce datetime literal format (YYYY-MM-DDThh:mm:ssZ).
+        Note: is_latest_version is a ContentVersion-level filter and is NOT
+        included here — it is handled separately in _query_all_versions().
 
-        Returns an empty string when no filters are active.
+        Returns an empty string when no applicable filters are active.
         """
         if not filters:
             return ""
@@ -309,7 +251,6 @@ class ContentDocumentExporter:
         """
         if not date_str:
             return ""
-        # Basic sanity check – must match YYYY-MM-DD
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
             return ""
         time_part = "T00:00:00Z" if start_of_day else "T23:59:59Z"
@@ -324,200 +265,56 @@ class ContentDocumentExporter:
     # Salesforce query methods
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _query_linked_document_ids(self, object_type: str) -> Set[str]:
-        """
-        Return the ContentDocumentIds linked to any record of `object_type`.
-
-        Salesforce Files don't carry a Parent/Type field the way legacy
-        Attachments do — the link lives on ContentDocumentLink.LinkedEntityId,
-        a polymorphic field that can't be filtered by LinkedEntity.Type
-        directly. The standard workaround is a semi-join scoping
-        LinkedEntityId to the target object's own Id space:
-
-            SELECT ContentDocumentId FROM ContentDocumentLink
-            WHERE LinkedEntityId IN (SELECT Id FROM {object_type})
-        """
+    def _query_content_documents(self, filters: Optional[Dict] = None) -> List[Dict]:
+        """Query ContentDocument records, optionally filtered."""
         try:
-            query = (
-                "SELECT ContentDocumentId "
-                "FROM ContentDocumentLink "
-                f"WHERE LinkedEntityId IN (SELECT Id FROM {object_type})"
-            )
+            where_clause = self._build_where_clause(filters)
+
+            query = f"""
+                SELECT Id, Title, FileExtension, FileType, ContentSize,
+                       CreatedDate, CreatedById, LastModifiedDate, LastModifiedById,
+                       OwnerId, ParentId, IsArchived, IsDeleted,
+                       ArchivedDate, ArchivedById, Description,
+                       PublishStatus, LatestPublishedVersionId
+                FROM ContentDocument
+                {where_clause}
+                ORDER BY CreatedDate DESC
+            """
+
             self._log_status(f"SOQL: {' '.join(query.split())}")
 
             result = self.sf.query_all(query)
-            return {r['ContentDocumentId'] for r in result['records']}
-
-        except Exception as e:
-            self._log_status(f"  ⚠️ Error querying ContentDocumentLink for {object_type}: {str(e)}")
-            return set()
-
-    def _query_content_documents(
-        self,
-        filters: Optional[Dict] = None,
-        restrict_to_ids: Optional[Set[str]] = None,
-    ) -> List[Dict]:
-        """
-        Query ContentDocument records, optionally filtered and/or restricted
-        to a specific set of Ids (the linked-object filter resolves to this).
-        """
-        if restrict_to_ids is not None and len(restrict_to_ids) == 0:
-            return []
-
-        try:
-            base_where = self._build_where_clause(filters)
-
-            if not restrict_to_ids:
-                query = self._build_content_document_query(base_where)
-                self._log_status(f"SOQL: {' '.join(query.split())}")  # compact log
-                result = self.sf.query_all(query)
-                return result['records']
-
-            # Batch the Id list so each "Id IN (...)" clause stays well under
-            # Salesforce's SOQL length limit, then merge the batched results.
-            all_records: List[Dict] = []
-            for batch in self._chunk(sorted(restrict_to_ids), self._ID_CHUNK_SIZE):
-                id_clause = "Id IN (" + ",".join(f"'{doc_id}'" for doc_id in batch) + ")"
-                where_clause = self._combine_where(base_where, id_clause)
-                query = self._build_content_document_query(where_clause)
-                self._log_status(f"SOQL: {' '.join(query.split())}")  # compact log
-                result = self.sf.query_all(query)
-                all_records.extend(result['records'])
-
-            return all_records
+            return result['records']
 
         except Exception as e:
             self._log_status(f"ERROR querying ContentDocument: {str(e)}")
             raise
 
-    @staticmethod
-    def _build_content_document_query(where_clause: str) -> str:
-        """Build the ContentDocument SELECT statement for a given WHERE clause."""
-        return f"""
-            SELECT Id, Title, FileExtension, FileType, ContentSize,
-                   CreatedDate, CreatedById, LastModifiedDate, LastModifiedById,
-                   OwnerId, ParentId, IsArchived, IsDeleted,
-                   ArchivedDate, ArchivedById, Description,
-                   PublishStatus, LatestPublishedVersionId
-            FROM ContentDocument
-            {where_clause}
-            ORDER BY CreatedDate DESC
-        """
-
-    @staticmethod
-    def _combine_where(base_where: str, extra_condition: str) -> str:
-        """Combine an existing 'WHERE ...' clause (or '') with one more bare condition."""
-        if base_where:
-            return f"{base_where} AND {extra_condition}"
-        return f"WHERE {extra_condition}"
-
-    @staticmethod
-    def _chunk(items: List, size: int):
-        """Yield successive `size`-length slices of `items`."""
-        for i in range(0, len(items), size):
-            yield items[i:i + size]
-
-    def _query_versions_batch(
+    def _query_all_versions(
         self,
-        document_ids: List[str],
-        filters: Optional[Dict] = None,
-    ) -> Dict[str, List[Dict]]:
+        document_id: str,
+        latest_only: bool = False,
+    ) -> List[Dict]:
         """
-        Batch-query ContentVersion records for every document in one pass.
-
-        Instead of one SOQL per document, all IDs are chunked into batches of
-        _ID_CHUNK_SIZE and each batch fires a single query.  For 10,000 docs
-        this drops ~10,000 round trips to ~25.
+        Query ContentVersion records for a specific ContentDocument.
 
         Args:
-            document_ids: ContentDocument Ids to look up.
-            filters:      Optional filter dict — respects the 'is_latest' key.
+            document_id: ContentDocument Id.
+            latest_only: When True, adds AND IsLatest = true so only the
+                         single latest version is returned. Defaults to False
+                         (all versions are returned).
 
         Returns:
-            Dict mapping each ContentDocumentId to its list of version records,
-            ordered by VersionNumber ASC.
-        """
-        is_latest_filter = (filters or {}).get("is_latest", "")
-        is_latest_clause = ""
-        if is_latest_filter == "True":
-            is_latest_clause = " AND IsLatest = true"
-        elif is_latest_filter == "False":
-            is_latest_clause = " AND IsLatest = false"
-
-        versions_map: Dict[str, List[Dict]] = {}
-        batches = list(self._chunk(document_ids, self._ID_CHUNK_SIZE))
-
-        for batch_num, batch in enumerate(batches, 1):
-            id_list = ",".join(f"'{did}'" for did in batch)
-            query = f"""
-                SELECT Id, ContentDocumentId, VersionNumber, IsLatest,
-                       ContentSize, CreatedDate, LastModifiedDate
-                FROM   ContentVersion
-                WHERE  ContentDocumentId IN ({id_list}){is_latest_clause}
-                ORDER BY ContentDocumentId ASC, VersionNumber ASC
-            """
-            self._log_status(
-                f"  Version batch {batch_num}/{len(batches)} "
-                f"({len(batch)} documents)..."
-            )
-            try:
-                result = self.sf.query_all(query)
-                for record in result['records']:
-                    doc_id = record['ContentDocumentId']
-                    versions_map.setdefault(doc_id, []).append(record)
-            except Exception as e:
-                self._log_status(f"  ⚠️ Version batch {batch_num} error: {e}")
-
-        return versions_map
-
-    @staticmethod
-    def _build_csv_row(
-        doc: Dict,
-        version: Dict,
-        path_on_client: str,
-        is_latest: bool,
-        total_versions: int,
-    ) -> List:
-        """
-        Build a single CSV data row from a document + version pair.
-
-        Extracted so both the incremental writer in export_content_documents
-        and the bulk writer in _create_csv_file share identical column logic.
-        """
-        return [
-            doc.get('Title', ''),
-            path_on_client,
-            doc.get('Id', ''),
-            '',                                          # FirstPublishLocationId (user fills in)
-            doc.get('Description', ''),
-            'H',                                         # Origin: 'H' = Content uploaded by user
-            version.get('VersionNumber', ''),
-            'TRUE' if is_latest else 'FALSE',
-            total_versions,
-            doc.get('FileExtension', ''),
-            doc.get('FileType', ''),
-            version.get('ContentSize', 0),
-            version.get('CreatedDate', ''),
-            version.get('LastModifiedDate', ''),
-            doc.get('OwnerId', ''),
-        ]
-
-    def _query_all_versions(self, document_id: str) -> List[Dict]:
-        """
-        Query all versions for a specific ContentDocument.
-
-        Args:
-            document_id: ContentDocument Id
-
-        Returns:
-            List of ContentVersion records with version info
+            List of ContentVersion records.
         """
         try:
+            version_filter = " AND IsLatest = true" if latest_only else ""
+
             query = f"""
                 SELECT Id, ContentDocumentId, VersionNumber, IsLatest,
                     ContentSize, CreatedDate, LastModifiedDate
                 FROM ContentVersion
-                WHERE ContentDocumentId = '{document_id}'
+                WHERE ContentDocumentId = '{document_id}'{version_filter}
                 ORDER BY VersionNumber ASC
             """
 
@@ -670,6 +467,52 @@ class ContentDocumentExporter:
         self._log_status(f"✅ Total rows exported: {len(all_version_data)}")
 
         return output_path
+    
+    
+    def _create_failed_csv_file(
+        self, failed_files: List[Dict], main_output_path: str
+    ) -> str:
+        """
+        Write a CSV listing every file that failed to download.
+
+        The file is placed in the same directory as the main CSV and named
+        by appending '_failed' to the base name, e.g.:
+            export_20241201_120000.csv  →  export_20241201_120000_failed.csv
+
+        Args:
+            failed_files:     List of failure dicts from stats['failed_files'].
+                              Each dict has keys: filename, id, version, reason.
+            main_output_path: Full path of the successfully-written main CSV.
+
+        Returns:
+            Full path of the created failed-records CSV.
+        """
+        base, ext = os.path.splitext(main_output_path)
+        failed_path = f"{base}_failed{ext}"
+
+        headers = [
+            'Filename',
+            'ContentDocumentId',
+            'VersionNumber',
+            'Error Reason',
+        ]
+
+        with open(failed_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(headers)
+
+            for record in failed_files:
+                writer.writerow([
+                    record.get('filename', ''),
+                    record.get('id', ''),
+                    record.get('version', ''),
+                    record.get('reason', ''),
+                ])
+
+        self._log_status(f"⚠️ Failed records CSV: {failed_path}")
+        self._log_status(f"⚠️ Total failed records: {len(failed_files)}")
+
+        return failed_path
 
     # ──────────────────────────────────────────────────────────────────────────
     # Logging
